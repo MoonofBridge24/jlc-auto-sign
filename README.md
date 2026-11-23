@@ -238,14 +238,20 @@ Server酱3 推送在退出前完成，所以消息照常能收到。
 **不会直接改 main**，而是：
 
 1. 有更新时把上游提交应用到独立分支 `upstream-sync`（跳过上游的空提交和 `.github/workflows` 改动，
-   冲突的提交会跳过并在通知里列出）；
-2. 开一个带 `upstream-sync` 标签的 issue 通知仓库管理者，里面列出提交、变更文件、跳过项；
-   已有未关闭的通知时只追加评论，不重复开；
-3. 你确认后到 **Actions → 合并上游同步分支到 main → Run workflow**，
-   工作流会把 `upstream-sync` 快进合并进 main，**关闭对应的通知 issue**，然后删除该分支。
+   冲突的提交会跳过并在 PR 里列出）；
+2. 对 `main` 开一个带 `upstream-sync` 标签的 **Pull Request** 通知仓库管理者，里面列出提交、变更文件、跳过项；
+   已有未关闭的同步 PR 时只更新正文并追加评论，不重复开；
+3. 你确认后，在 PR 页面点 **Merge pull request** 即可合并到 main；
+   或者到 **Actions → 合并上游同步分支到 main → Run workflow**，
+   工作流会合并 `upstream-sync` 到 main、清理对应 PR，然后删除该分支。
 
-手动合并工作流有三个选项：分支名（默认 `upstream-sync`）、是否删除分支、是否关闭通知。
+手动合并工作流有三个选项：分支名（默认 `upstream-sync`）、是否删除分支、是否清理同步 PR。
 如果 main 在此期间被改过、产生冲突，合并会中止并报错，需要本地解决后再推。
+
+> 首次使用 PR 通知时，如果日志报 `GitHub Actions is not permitted to create or approve pull requests`，
+> 到 **Settings → Actions → General → Workflow permissions** 勾选
+> **Allow GitHub Actions to create and approve pull requests** 再重跑即可
+> （分支此时已经推送成功，也可以直接手动开 PR）。
 
 > 上游的 `.github/workflows` 改动不会被同步——本仓库的 workflow 是定制的，
 > 而且 `GITHUB_TOKEN` 也无权推送 workflow 文件。上游的 workflow 变更需要你手动参考。

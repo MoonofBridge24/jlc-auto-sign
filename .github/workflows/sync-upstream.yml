@@ -1,9 +1,9 @@
-name: 上游同步（只建分支 + 通知，不直接合并）
+name: 上游同步（只建分支 + 开 PR，不直接合并）
 
 # 这个脚本做三件事：
 #   1. 检查上游仓库（UPSTREAM_REPO）是否有新提交；
-#   2. 有更新时把提交 cherry-pick 到独立分支 upstream-sync 并推送，**不碰 main**；
-#   3. 开一个 issue 通知仓库管理者，等人工确认后再跑「合并上游同步分支到 main」工作流。
+#   2. 有更新时把提交应用到独立分支 upstream-sync 并推送，**不碰 main**；
+#   3. 对 main 开一个 Pull Request 通知仓库管理者，等人工确认后合并。
 # 另外仍然保留 heartbeat 保活（防止 actions 因仓库不活跃被自动禁用），心跳只在 heartbeat 分支。
 
 on:
@@ -12,13 +12,14 @@ on:
   workflow_dispatch:  # 支持手动触发
 
 permissions:
-  contents: write  # 推送同步分支 / heartbeat 分支
-  issues: write    # 创建和更新同步通知 issue
+  contents: write       # 推送同步分支 / heartbeat 分支
+  pull-requests: write  # 创建和更新同步 PR
 
 env:
   UPSTREAM_REPO: zhangMonday/PCBfactory-auto-check-in
   SYNC_BRANCH: upstream-sync
-  ISSUE_LABEL: upstream-sync
+  BASE_BRANCH: main
+  PR_LABEL: upstream-sync
 
 jobs:
   sync-upstream:
@@ -28,7 +29,7 @@ jobs:
       - name: 检出仓库代码
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # 获取完整历史，便于 cherry-pick
+          fetch-depth: 0  # 获取完整历史，便于逐个应用上游提交
 
       - name: 设置 Git 配置
         run: |
@@ -69,7 +70,7 @@ jobs:
             echo "上游没有新的有效变更"
           fi
 
-      - name: 在独立分支上合并上游更新
+      - name: 在独立分支上应用上游更新
         id: prepare
         if: steps.check-update.outputs.has_update == 'true'
         run: |
@@ -139,7 +140,7 @@ jobs:
           fi
 
           if git diff --quiet main..HEAD; then
-            echo "🟡 上游提交没有产生实际变更（可能全是空提交），不建分支也不通知"
+            echo "🟡 上游提交没有产生实际变更（可能全是空提交），不建分支也不开 PR"
             git checkout -q main
             git branch -D "$SYNC_BRANCH" >/dev/null 2>&1 || true
             echo "has_branch=false" >> "$GITHUB_OUTPUT"
@@ -153,7 +154,7 @@ jobs:
           echo "has_branch=true" >> "$GITHUB_OUTPUT"
           echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
 
-          # 通知正文写到 RUNNER_TEMP，避免被后面的 heartbeat 步骤清理掉
+          # PR 正文写到 RUNNER_TEMP，避免被后面的 heartbeat 步骤清理掉
           {
             echo "上游仓库 \`${UPSTREAM_REPO}\` 有新提交，已同步到分支 \`${SYNC_BRANCH}\`，**尚未合并到 main**。"
             echo
@@ -185,32 +186,56 @@ jobs:
             git diff --name-status main..HEAD | head -50
             echo '```'
             echo
-            echo "确认无误后，运行 **Actions → 合并上游同步分支到 main → Run workflow** 完成合并。"
-            echo "合并成功后本 issue 会自动关闭，\`${SYNC_BRANCH}\` 分支也会被删除。"
+            echo "**确认无误后，直接在这个 PR 上点 \`Merge pull request\` 即可合并到 main。**"
+            echo
+            echo "也可以运行 **Actions → 合并上游同步分支到 main → Run workflow**："
+            echo "它会合并分支、关闭这个 PR 并删除分支，适合想顺手清理的场景。"
           } > "$REPORT"
           echo "REPORT=$REPORT" >> "$GITHUB_ENV"
 
-      - name: 通知仓库管理者
+      - name: 开 PR 通知仓库管理者
         if: steps.prepare.outputs.has_branch == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AHEAD: ${{ steps.prepare.outputs.ahead }}
         run: |
           set -euo pipefail
           TITLE="上游同步待合并（${SYNC_BRANCH}，$(date -u '+%Y-%m-%d')）"
 
-          gh label create "$ISSUE_LABEL" --color FBCA04 \
+          gh label create "$PR_LABEL" --color FBCA04 \
             --description "上游同步分支待合并" --force >/dev/null 2>&1 || true
 
-          EXISTING=$(gh issue list --label "$ISSUE_LABEL" --state open --limit 1 \
+          # 同一个 head 分支只允许存在一个 open PR，已存在就更新正文
+          EXISTING=$(gh pr list --head "$SYNC_BRANCH" --base "$BASE_BRANCH" --state open --limit 1 \
             --json number --jq '.[0].number // empty')
 
           if [ -n "${EXISTING:-}" ]; then
-            echo "已有待合并通知 #$EXISTING，追加一条评论"
-            gh issue comment "$EXISTING" --body-file "$REPORT"
-            echo "::notice title=上游同步::分支 $SYNC_BRANCH 已更新，已追加到 #$EXISTING"
+            gh pr edit "$EXISTING" --title "$TITLE" --body-file "$REPORT" >/dev/null
+            gh pr comment "$EXISTING" --body "🔄 分支已更新（新增 ${AHEAD} 个待合并提交，$(date -u '+%Y-%m-%d %H:%M UTC')），正文已刷新。" >/dev/null
+            echo "::notice title=上游同步::PR #$EXISTING 已更新，等待人工合并"
           else
-            URL=$(gh issue create --title "$TITLE" --body-file "$REPORT" --label "$ISSUE_LABEL")
-            echo "::notice title=上游同步::已创建通知 $URL，等待人工确认后合并"
+            # force push 之后 GitHub 偶尔会短暂认为「没有差异」，这里重试几次
+            URL=""
+            for attempt in 1 2 3; do
+              if URL=$(gh pr create --base "$BASE_BRANCH" --head "$SYNC_BRANCH" \
+                   --title "$TITLE" --body-file "$REPORT" --label "$PR_LABEL" 2>&1); then
+                break
+              fi
+              echo "第 ${attempt} 次创建 PR 失败：$URL"
+              URL=""
+              if [ "$attempt" -lt 3 ]; then sleep 5; fi
+            done
+
+            if [ -z "$URL" ]; then
+              echo "::error title=创建 PR 失败::连续 3 次都没能创建 PR"
+              echo "如果提示 'GitHub Actions is not permitted to create or approve pull requests'，"
+              echo "请到仓库 Settings → Actions → General → Workflow permissions 勾选"
+              echo "'Allow GitHub Actions to create and approve pull requests' 后重跑。"
+              echo "分支 ${SYNC_BRANCH} 已推送成功，也可以手动在网页上对 main 开 PR。"
+              exit 1
+            fi
+            echo "$URL" >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice title=上游同步::$URL 已创建，等待人工合并"
           fi
 
       - name: 心跳提交（heartbeat 分支）
@@ -241,4 +266,5 @@ jobs:
             echo "- 上游新提交：${{ steps.check-update.outputs.commit_count || 0 }} 个"
             echo "- 是否建了同步分支：${{ steps.prepare.outputs.has_branch || 'false' }}"
             echo "- 同步分支：\`${SYNC_BRANCH}\`（main 未被修改）"
+            echo "- 待合并提交：${{ steps.prepare.outputs.ahead || 0 }} 个"
           } >> "$GITHUB_STEP_SUMMARY"
