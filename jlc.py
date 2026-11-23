@@ -1165,6 +1165,8 @@ def _empty_account_result(account_index, retry_count=0, is_final_retry=False):
         'last_sign_at': '',
         # 本次运行是否真的产生了新的签到成功记录（用于决定要不要推送）
         'signed_now': False,
+        # 是否已经往凭证里写过今日完成记录（避免补记写两遍）
+        'recorded': False,
     }
 
 
@@ -1502,16 +1504,29 @@ def _mark_already_done(result, record, account_index):
     return result
 
 
+def _did_sign_now(result):
+    """
+    本次运行是否真的签上了（有一侧拿到「签到成功」）。
+
+    「今天已经签过」也算 success，但不属于新增记录——不区分的话，
+    同一天第二次运行会误判成有新签到成功，白推一条消息。
+    """
+    return (result.get('oshwhub_status') == '签到成功'
+            or result.get('jindou_status') == '签到成功')
+
+
 def _finish_account(username, result, account_index):
     """
     收尾：两边都成功的账号，把「今天已完成」写进凭证（随 secret 持久化）。
-    只有真的跑了签到（不是今日已完成跳过）才标记 signed_now，推送据此判断有没有新记录。
+    last_sign 用来让同一天内的后续运行跳过该账号；
+    signed_now 只表示「本次真的签上了」，推送据此决定要不要发消息。
     """
     if (result.get('oshwhub_success') and result.get('jindou_success')
             and not result.get('skipped_today')):
         record = record_sign_success(username, result, account_index)
-        result['signed_now'] = True
         result['last_sign_at'] = record.get('at') or ''
+        result['recorded'] = True
+        result['signed_now'] = _did_sign_now(result)
     return result
 
 
@@ -1636,6 +1651,7 @@ def _merge_results(best, new):
     # 今日已跳过 / 本次产生过新记录：任一次命中就保留，避免合并后丢失
     merged['skipped_today'] = bool(best.get('skipped_today') or new.get('skipped_today'))
     merged['signed_now'] = bool(best.get('signed_now') or new.get('signed_now'))
+    merged['recorded'] = bool(best.get('recorded') or new.get('recorded'))
     if not merged.get('last_sign_at'):
         merged['last_sign_at'] = new.get('last_sign_at') or ''
     return merged
@@ -2142,14 +2158,17 @@ def main():
         all_results = execute_final_retry_for_failed_accounts(all_results, usernames, passwords, total_accounts)
 
     # 补记：只有部分重试后才两边都成功的账号，也要写「今日已完成」记录，
-    # 否则下次运行还会再去请求一遍接口
+    # 否则下次运行还会再去请求一遍接口。注意 signed_now 仍按"本次是否真签上"判断，
+    # 全部是「今日已签到」时不算新增，不触发推送
     for result in all_results:
         if (result.get('oshwhub_success') and result.get('jindou_success')
-                and not result.get('skipped_today') and not result.get('signed_now')):
+                and not result.get('skipped_today') and not result.get('recorded')):
             idx = result['account_index']
             if 0 < idx <= len(usernames):
-                record_sign_success(usernames[idx - 1], result, idx)
-                result['signed_now'] = True
+                record = record_sign_success(usernames[idx - 1], result, idx)
+                result['recorded'] = True
+                result['last_sign_at'] = record.get('at') or result.get('last_sign_at') or ''
+                result['signed_now'] = _did_sign_now(result)
     
     # 总结：一行一个账号，只打印必要信息
     log("=" * 62)
@@ -2227,6 +2246,8 @@ def main():
         log("失败账号：%s" % "、".join(_masked(i) for i in sorted(all_failed_accounts)))
     elif skipped_accounts and len(skipped_accounts) == total_accounts:
         log("全部账号今日已完成，本次没有发起签到")
+    elif new_success_count == 0:
+        log("全部账号今日已签到，本次没有新增签到记录（不推送）")
     else:
         log("全部账号签到成功")
     log("=" * 62)
