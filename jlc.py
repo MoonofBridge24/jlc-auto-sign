@@ -25,7 +25,7 @@ try:
 except ImportError:
     stealth = None
 
-from jlc_api import AuthExpired, ApiError, OshwhubClient, JlcBeanClient
+from jlc_api import (AuthExpired, ApiError, OshwhubClient, JlcBeanClient, MOBILE_UA)
 
 # 默认无头运行（GitHub Actions 没有显示器）；本地调试可以设 JLC_HEADLESS=0 打开窗口
 HEADLESS = os.getenv("JLC_HEADLESS", "1") != "0"
@@ -116,7 +116,162 @@ def _current_ua(driver):
     try:
         return driver.execute_script("return navigator.userAgent;") or ""
     except Exception:
-        return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "               "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        return ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+
+def _chrome_major(ua):
+    m = re.search(r"Chrome/(\d+)", ua or "")
+    return m.group(1) if m else "120"
+
+
+def _ua_metadata(ua, mobile=False):
+    """UA-CH 低熵信息：默认从 UA 里取版本号，不写死"""
+    major = _chrome_major(ua)
+    return {
+        "brands": [
+            {"brand": "Google Chrome", "version": major},
+            {"brand": "Chromium", "version": major},
+            {"brand": "Not.A/Brand", "version": "99"},
+        ],
+        "fullVersion": "%s.0.0.0" % major,
+        "platform": "iOS" if mobile else "Windows",
+        "platformVersion": "17.2.1" if mobile else "10.0.0",
+        "architecture": "",
+        "model": "iPhone" if mobile else "",
+        "mobile": bool(mobile),
+        "bitness": "",
+        "wow64": False,
+    }
+
+
+def switch_ua(driver, ua, mobile=False):
+    """
+    会话级切换 UA：请求头与 navigator.userAgent 同时生效。
+
+    m.jlc.com 按 UA 分端：桌面 UA 会被 302 到 www.jlc.com（PC 站），
+    PC 站前端不存 X-JLC-AccessToken，所以取 token 前必须先切成移动端 UA。
+    """
+    if not ua or not hasattr(driver, "execute_cdp_cmd"):
+        return False
+
+    params = {
+        "userAgent": ua,
+        "acceptLanguage": "zh-CN,zh;q=0.9,en;q=0.8",
+        "platform": "iPhone" if mobile else "Win32",
+        "userAgentMetadata": _ua_metadata(ua, mobile),
+    }
+    switched = False
+    for cmd in ("Emulation.setUserAgentOverride", "Network.setUserAgentOverride"):
+        try:
+            driver.execute_cdp_cmd(cmd, params)
+            switched = True
+            break
+        except Exception:
+            continue
+    if not switched:
+        return False
+
+    try:
+        if mobile:
+            driver.execute_cdp_cmd("Emulation.setDeviceMetricsOverride", {
+                "width": 390, "height": 844, "deviceScaleFactor": 3, "mobile": True,
+            })
+            driver.execute_cdp_cmd("Emulation.setTouchEmulationEnabled",
+                                   {"enabled": True, "maxTouchPoints": 5})
+        else:
+            driver.execute_cdp_cmd("Emulation.clearDeviceMetricsOverride", {})
+            driver.execute_cdp_cmd("Emulation.setTouchEmulationEnabled", {"enabled": False})
+    except Exception:
+        pass
+    return True
+
+
+_INPAGE_FETCH_JS = """
+var cb = arguments[arguments.length - 1];
+var url = arguments[0];
+var headers = (arguments[1] || {}).headers || {};
+fetch(url, {credentials: 'include', headers: headers})
+  .then(function (r) {
+    return r.text().then(function (t) {
+      cb({status: r.status, body: (t || '').slice(0, 300)});
+    });
+  })
+  .catch(function (e) { cb({status: 0, body: String(e)}); });
+"""
+
+
+def inpage_fetch(driver, url, headers=None, timeout=15):
+    """用页面自身上下文发请求：自动继承 Cookie / Origin / Referer"""
+    try:
+        driver.set_script_timeout(timeout)
+        result = driver.execute_async_script(
+            _INPAGE_FETCH_JS, url, {"headers": headers or {}})
+        return result or {}
+    except Exception as e:
+        return {"status": 0,
+                "body": "页面内请求失败: %s" % str(e).splitlines()[0][:120]}
+
+
+def wait_oshwhub_login(driver, account_index, timeout=15.0):
+    """
+    等开源平台登录态真正生效。
+
+    SSO 回跳到 oshwhub.com 时 Cookie 还没换好（前端拿到 ticket 后再调一次接口才写
+    session Cookie），只看 URL 就取凭证会拿到匿名会话，接着调 /api/users 就是 401。
+    这里在页面里轮询 /api/users，200 才算登录完成。
+    """
+    try:
+        if "oshwhub.com" not in (driver.current_url or ""):
+            # 不在开源平台页面时，页面内 fetch 是跨域请求（会被 CORS 挡掉），先回站内
+            log("账号 %s - 当前不在开源平台页面，先回到 sign_in 再校验" % account_index)
+            driver.get("https://oshwhub.com/sign_in")
+            WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body")))
+            time.sleep(1)
+    except Exception as e:
+        log("账号 %s - 回到开源平台页面失败: %s" % (
+            account_index, str(e).splitlines()[0][:120]))
+
+    deadline = time.time() + timeout
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        res = inpage_fetch(driver, "https://oshwhub.com/api/users", timeout=10)
+        status = res.get("status")
+        if status == 200:
+            log("账号 %s - 页面内校验登录态通过（第 %d 次）" % (account_index, attempt))
+            return True
+        log("账号 %s - 页面内校验登录态: HTTP %s（第 %d 次），继续等" % (
+            account_index, status or "无响应", attempt))
+        time.sleep(1.2)
+    return False
+
+
+def _cookie_header_from_performance(driver, url_part):
+    """从 performance 日志里取浏览器真实发出的 Cookie 请求头"""
+    try:
+        logs = driver.get_log("performance")
+    except Exception:
+        return ""
+
+    header = ""
+    for entry in logs:
+        try:
+            message = json.loads(entry["message"]).get("message", {}) or {}
+            request = ((message.get("params") or {}).get("request") or {})
+            if url_part not in (request.get("url") or ""):
+                continue
+            for key, value in (request.get("headers") or {}).items():
+                if key.lower() == "cookie" and value:
+                    header = value
+        except Exception:
+            continue
+    return header
+
+
+def _cookie_header_from_dict(cookies):
+    return "; ".join("%s=%s" % (name, value) for name, value in cookies.items())
 
 
 def create_driver():
@@ -212,6 +367,8 @@ CREDENTIAL_FILE = os.getenv("JLC_CREDENTIAL_FILE", "credentials.json")
 credential_cache = {}
 credential_loaded = False
 credential_dirty = False
+# 本次运行里已经真正登录过的账号：最终重试时不再重复登录，避免连续登录触发风控
+login_done_accounts = set()
 
 
 def _now_text():
@@ -286,9 +443,10 @@ def drop_cached_credentials(username, parts=('points', 'beans')):
         return
     if 'points' in parts:
         cred['cookies'] = {}
+        cred['cookie_header'] = ''
     if 'beans' in parts:
         cred['access_token'] = ''
-    if not cred.get('cookies') and not cred.get('access_token'):
+    if not cred.get('cookies') and not cred.get('cookie_header') and not cred.get('access_token'):
         credential_cache.pop(username, None)
     else:
         credential_cache[username] = cred
@@ -336,6 +494,30 @@ def _mask_secret(value, keep=6):
     return value[:keep] + "***"
 
 
+def _local_storage_tokens(driver):
+    """扫 localStorage 里所有名字带 token 的键（不同站点命名不一样，光靠固定 key 会漏）"""
+    try:
+        items = driver.execute_script(
+            "var out=[];"
+            "for (var i=0;i<localStorage.length;i++){"
+            "  var k=localStorage.key(i);"
+            "  if (/token/i.test(k)) out.push([k, localStorage.getItem(k)]);"
+            "}"
+            "return out;") or []
+    except Exception:
+        return []
+
+    tokens = []
+    for pair in items:
+        try:
+            key, value = pair[0], pair[1]
+        except (IndexError, TypeError):
+            continue
+        if value and len(str(value)) >= 16:
+            tokens.append((str(key), str(value)))
+    return tokens
+
+
 def _read_token_from_local_storage(driver):
     """从 localStorage 读 X-JLC-AccessToken（各站点 key 大小写略有差异）"""
     for key in ("X-JLC-AccessToken", "x-jlc-accesstoken", "accessToken", "token"):
@@ -347,6 +529,10 @@ def _read_token_from_local_storage(driver):
         if value:
             log("从 localStorage(%s) 取到 access token: %s" % (key, _mask_secret(value)))
             return value
+
+    for key, value in _local_storage_tokens(driver):
+        log("从 localStorage(%s) 取到 access token: %s" % (key, _mask_secret(value)))
+        return value
     return None
 
 
@@ -371,12 +557,69 @@ def _read_token_from_performance(driver):
     return None
 
 
+def fetch_mobile_token(driver, account_index, desktop_ua, timeout=12.0):
+    """
+    切移动端 UA 进 m.jlc.com 取 X-JLC-AccessToken。
+
+    桌面 UA 访问 m.jlc.com 会被强制重定向到 www.jlc.com（PC 站），
+    PC 站前端不落 token，所以无论如何翻 localStorage / 请求头都拿不到。
+    """
+    log("账号 %s - 切换移动端 UA 访问 m.jlc.com 获取 access token" % account_index)
+    if not switch_ua(driver, MOBILE_UA, mobile=True):
+        log("账号 %s - 切换移动端 UA 失败（驱动不支持 CDP 覆盖 UA）" % account_index)
+
+    token = ""
+    for url in ("https://m.jlc.com/", "https://m.jlc.com/mapp/pages/my/index"):
+        try:
+            driver.get(url)
+            WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body")))
+        except Exception as e:
+            log("账号 %s - 打开 %s 失败: %s" % (
+                account_index, url, str(e).splitlines()[0][:120]))
+            continue
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            token = (_read_token_from_local_storage(driver)
+                     or _read_token_from_performance(driver))
+            if token:
+                break
+            time.sleep(1)
+
+        if token:
+            break
+        log("账号 %s - %s 未取到 token，当前地址: %s" % (
+            account_index, url, driver.current_url))
+
+    if token:
+        check = inpage_fetch(
+            driver,
+            "https://m.jlc.com/api/appPlatform/center/assets/selectPersonalAssetsInfo",
+            headers={"x-jlc-accesstoken": token, "x-jlc-clienttype": "WEB"},
+            timeout=10)
+        body = (check.get("body") or "")
+        log("账号 %s - token 校验: HTTP %s%s" % (
+            account_index, check.get("status") or "无响应",
+            "，接口可用" if '"success":true' in body.replace(" ", "") else ""))
+
+    # 切回桌面端 UA，避免影响后续页面状态
+    if desktop_ua:
+        switch_ua(driver, desktop_ua, mobile=False)
+    return token
+
+
 def extract_credentials_from_browser(driver, account_index):
     """
-    登录成功后在这一步一次性取走凭证，之后全部走 requests。
+    登录成功后一次性取走凭证，之后全部走 requests。
 
-    返回 {"cookies": {name: value}, "access_token": "...", "updated_at": "..."}
+    1. 先在页面里调 /api/users，确认登录态真的生效（SSO 回跳后 Cookie 是异步写入的）；
+    2. 抓浏览器实际发出的 Cookie 头（含 WAF 会话 Cookie），requests 侧原样带过去；
+    3. 切移动端 UA 进 m.jlc.com 取 X-JLC-AccessToken。
     """
+    if not wait_oshwhub_login(driver, account_index):
+        log("账号 %s - 页面内登录态校验未通过，仍尝试提取凭证" % account_index)
+
     cookies = {}
     try:
         for cookie in driver.get_cookies():
@@ -384,29 +627,19 @@ def extract_credentials_from_browser(driver, account_index):
     except Exception as e:
         log("账号 %s - 读取 Cookie 失败: %s" % (account_index, e))
 
-    log("账号 %s - 提取到 %d 个 Cookie，oshwhub_session=%s" % (
-        account_index, len(cookies), _mask_secret(cookies.get("oshwhub_session"))))
+    cookie_header = _cookie_header_from_performance(driver, "/api/users")
+    if cookie_header:
+        log("账号 %s - 取到浏览器实际 Cookie 头（%d 字节）" % (
+            account_index, len(cookie_header)))
+    elif cookies:
+        cookie_header = _cookie_header_from_dict(cookies)
+        log("账号 %s - 未抓到 Cookie 头，按 get_cookies() 拼了 %d 个" % (
+            account_index, len(cookies)))
 
+    desktop_ua = _current_ua(driver)
     token = _read_token_from_local_storage(driver) or _read_token_from_performance(driver)
-
     if not token:
-        # 开源平台的 localStorage 不一定存 token，去 m.jlc.com 走一次 SSO 再读
-        log("账号 %s - 开源平台没有 access token，访问 m.jlc.com 获取" % account_index)
-        try:
-            driver.get("https://m.jlc.com/")
-            WebDriverWait(driver, 12).until(
-                EC.presence_of_element_located((By.TAG_NAME, "body")))
-            # SPA 要等接口请求发出去才会带上 token，最多等 8 秒
-            for _ in range(8):
-                time.sleep(1)
-                token = (_read_token_from_local_storage(driver)
-                         or _read_token_from_performance(driver))
-                if token:
-                    break
-            for cookie in driver.get_cookies():
-                cookies.setdefault(cookie["name"], cookie["value"])
-        except Exception as e:
-            log("账号 %s - 访问 m.jlc.com 取 token 失败: %s" % (account_index, e))
+        token = fetch_mobile_token(driver, account_index, desktop_ua)
 
     if not token:
         # 个别环境把 token 放在 Cookie 里
@@ -416,19 +649,14 @@ def extract_credentials_from_browser(driver, account_index):
                 log("从 Cookie(%s) 取到 access token: %s" % (name, _mask_secret(value)))
                 break
 
-    # 只保留登录态相关的 Cookie：凭证要回写到 secret（限制 48KB），
-    # 而且 WAF 的 ssxmod 之类 Cookie 和 IP/UA 绑定，跨机器带过去反而更容易被拦。
-    session_cookies = {name: value for name, value in cookies.items()
-                       if 'session' in name.lower()}
-    if not session_cookies and cookies:
-        session_cookies = dict(cookies)
-
-    log("账号 %s - 凭证提取结果: access_token=%s, 登录态 Cookie=%d 个" % (
-        account_index, _mask_secret(token), len(session_cookies)))
+    log("账号 %s - 凭证提取结果: access_token=%s, Cookie=%d 个" % (
+        account_index, _mask_secret(token), len(cookies)))
 
     return {
-        "cookies": session_cookies,
+        "cookies": cookies,
+        "cookie_header": cookie_header,
         "access_token": token or "",
+        "ua": desktop_ua,
         "updated_at": _now_text(),
     }
 
@@ -780,33 +1008,63 @@ def sign_with_credentials(creds, account_index, result, only=None):
     # ---- 开源平台积分 ----
     if 'points' in only:
         cookies = creds.get('cookies') or {}
-        if not cookies:
+        cookie_header = creds.get('cookie_header') or ''
+        if not cookies and not cookie_header:
             log("账号 %s - 没有开源平台 Cookie，积分需要重新登录" % account_index)
             result['oshwhub_status'] = '凭证缺失'
             result['oshwhub_message'] = '没有 oshwhub Cookie'
             expired.append('points')
         else:
             log("账号 %s - 请求积分签到接口（Cookie 方式）..." % account_index)
-            try:
-                res = OshwhubClient(cookies, index=account_index, logger=log).run()
-                _apply_points_result(result, res)
-                log("账号 %s - 积分签到: %s，积分 %s → %s (%+d)" % (
-                    account_index, result['oshwhub_status'],
-                    result['initial_points'], result['final_points'],
-                    result['points_reward']))
-            except AuthExpired as e:
+            # 先按浏览器原样发（带全 WAF 会话 Cookie）；被拒再退回只用会话 Cookie，
+            # 因为缓存凭证里的 WAF Cookie 可能属于上一台机器/上一个时段。
+            header_options = [cookie_header, ''] if cookie_header else ['']
+            done = False
+            last_error = None
+            for header in header_options:
+                try:
+                    res = OshwhubClient(
+                        cookies,
+                        index=account_index,
+                        logger=log,
+                        cookie_header=header,
+                        ua=creds.get('ua') or '',
+                    ).run()
+                    _apply_points_result(result, res)
+                    log("账号 %s - 积分签到: %s，积分 %s → %s (%+d)" % (
+                        account_index, result['oshwhub_status'],
+                        result['initial_points'], result['final_points'],
+                        result['points_reward']))
+                    done = True
+                    break
+                except AuthExpired as e:
+                    last_error = e
+                    if header:
+                        log("账号 %s - 完整 Cookie 头被拒（%s），改用会话 Cookie 再试一次" % (
+                            account_index, e))
+                        continue
+                    result['oshwhub_status'] = '凭证失效'
+                    result['oshwhub_message'] = str(e)
+                    expired.append('points')
+                    log("账号 %s - 积分凭证失效: %s" % (account_index, e))
+                    done = True
+                    break
+                except ApiError as e:
+                    result['oshwhub_status'] = '签到失败'
+                    result['oshwhub_message'] = str(e)
+                    log("账号 %s - 积分签到失败: %s" % (account_index, e))
+                    done = True
+                    break
+                except Exception as e:
+                    result['oshwhub_status'] = '签到异常'
+                    result['oshwhub_message'] = '%s: %s' % (type(e).__name__, e)
+                    log("账号 %s - 积分签到异常: %s" % (account_index, e))
+                    done = True
+                    break
+            if not done and last_error is not None:
                 result['oshwhub_status'] = '凭证失效'
-                result['oshwhub_message'] = str(e)
+                result['oshwhub_message'] = str(last_error)
                 expired.append('points')
-                log("账号 %s - 积分凭证失效: %s" % (account_index, e))
-            except ApiError as e:
-                result['oshwhub_status'] = '签到失败'
-                result['oshwhub_message'] = str(e)
-                log("账号 %s - 积分签到失败: %s" % (account_index, e))
-            except Exception as e:
-                result['oshwhub_status'] = '签到异常'
-                result['oshwhub_message'] = '%s: %s' % (type(e).__name__, e)
-                log("账号 %s - 积分签到异常: %s" % (account_index, e))
 
     # ---- 嘉立创金豆 ----
     if 'beans' in only:
@@ -887,6 +1145,12 @@ def sign_in_account(username, password, account_index, total_accounts,
         need = None
 
     # 2. 登录拿新凭证（只重跑未成功的部分，避免重复签到）
+    if is_final_retry and creds and username in login_done_accounts:
+        log("账号 %s - 本次运行已登录过，最终重试不再重复登录，直接用现有凭证重试" % (
+            account_index))
+        sign_with_credentials(creds, account_index, result, only=need or None)
+        return result
+
     new_creds, error = login_for_credentials(username, password, account_index)
 
     if error:
@@ -906,6 +1170,7 @@ def sign_in_account(username, password, account_index, total_accounts,
         return result
 
     set_cached_credentials(username, new_creds)
+    login_done_accounts.add(username)
     result['credential_source'] = '登录'
     log("账号 %s - 登录成功，凭证已缓存" % account_index)
 
@@ -1457,7 +1722,7 @@ def main():
             if result['points_reward'] > 0:
                 log(f"  ├── 积分变化: {result['initial_points']} → {result['final_points']} (+{result['points_reward']})")
                 total_points_reward += result['points_reward']
-            elif result['points_reward'] == 0 and result['initial_points'] > 0:
+            elif result['oshwhub_success']:
                 log(f"  ├── 积分变化: {result['initial_points']} → {result['final_points']} (0)")
             else:
                 log("  ├── 积分状态: 无法获取积分信息")
@@ -1471,7 +1736,7 @@ def main():
                     jindou_text += "（有奖励）"
                 log(jindou_text)
                 total_jindou_reward += result['jindou_reward']
-            elif result['jindou_reward'] == 0 and result['initial_jindou'] > 0:
+            elif result['jindou_success']:
                 log(f"  ├── 金豆变化: {result['initial_jindou']} → {result['final_jindou']} (0)")
             else:
                 log("  ├── 金豆状态: 无法获取金豆信息")

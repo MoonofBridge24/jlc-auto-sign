@@ -47,11 +47,23 @@ Github Actions 单次任务执行时长限制在 6 小时以内，即使每个�
 | 环节 | 实现方式 | 凭证 |
 | --- | --- | --- |
 | 登录 | Selenium + 阿里云滑块 | 账号密码 |
-| 开源平台积分签到 | `GET/POST https://oshwhub.com/api/users*` | Cookie（`oshwhub_session`） |
+| 开源平台积分签到 | `GET/POST https://oshwhub.com/api/users*` | Cookie（整串，关键 `oshwhub_session`） |
 | 嘉立创金豆签到 | `https://m.jlc.com/api/activity/sign/*` | 请求头 `X-JLC-AccessToken` |
 
 这样即使无头浏览器被风控、或者 Actions 上启动浏览器很慢，只要凭证还有效，签到本身几乎不受影响。
 凭证失效（401）时才会重新走一次浏览器登录。
+
+取凭证这一步有三个坑，代码里都已处理，排错时可以对照：
+
+1. **SSO 回跳成功 ≠ 登录态已生效。** 从 passport 跳回 `oshwhub.com` 时 URL 已经变了，
+   但 session Cookie 是页面再发一次请求之后才写进去的。只看 URL 就取 Cookie 会拿到
+   匿名会话，接着调接口一直 401。所以脚本会在页面里轮询 `GET /api/users`，等它 200 才取凭证。
+2. **`m.jlc.com` 必须用移动端 UA 访问。** 桌面 UA 会被强制 302 到 `www.jlc.com`（PC 站），
+   PC 站前端不保存 `X-JLC-AccessToken`，怎么翻 localStorage 都拿不到。脚本用 CDP 把 UA
+   切成移动端（连 UA-CH 的 `mobile: true` 一起改）再进站取 token，取完切回桌面 UA。
+3. **Cookie 要整串带走。** 登录态分散在 `oshwhub_session`、`oshwhub_csrf`、`isLoginCustomerFlag`、
+   `jlc_customer_code` 等多个 Cookie 里，只留名字带 `session` 的会缺信息。请求时优先发浏览器
+   原样的 Cookie 头，被拒再退回「只用会话 Cookie」重试一次（缓存里的 WAF Cookie 可能属于旧 IP）。
 
 > 开源平台的「7天好礼 / 月度好礼」按钮在页面上是前端弹窗，没有稳定的公开接口，目前不再自动点击；
 > 金豆侧的第七天奖励仍会在签到后自动调用 `receiveVoucher` 领取。
@@ -333,6 +345,10 @@ JLC_BROWSER=edge JLC_HEADLESS=0 JLC_USERNAME=13800138000 JLC_PASSWORD=你的密�
 - **日志说「使用缓存凭证，未启动浏览器」**：正常。说明上次留下的 Cookie/Token 还有效，签到全部走接口。
 - **日志说「缓存凭证不可用」**：Cookie 或 Token 过期了（通常是手动退出过账号），脚本会自动重新登录并刷新 secret，无需处理。
 - **只失败金豆 / 只失败积分**：看日志里的原因。`凭证失效` 会自动重登；`418 被 WAF 拦截` 是请求被风控，重试通常能过；`success=false` 一般是当天接口限流或活动变更。
+- **重登后积分仍 `401（未登录或凭证失效）`**：多半是取凭证的时机不对——SSO 刚跳回时 session Cookie 还没写好。正常日志里应该能看到
+  `页面内校验登录态通过`；如果没有，说明页面内 `/api/users` 一直不是 200，往上翻日志看是不是还停在 passport 页。
+- **只失败金豆、日志说「没有金豆 access token」**：确认 `fetch_mobile_token` 那段有没有打印
+  `切换移动端 UA 访问 m.jlc.com`；如果打印了但还是没有，看紧随其后的「当前地址」是不是 `www.jlc.com`（UA 没切成功）。
 - **滑块一直「验证失败」**：先确认 `stealth.py` 注入成功（`window.cdc_*` 标记已抹掉），并检查是否误加了 `--blink-settings=imagesEnabled=false`（会让滑块背景图不渲染、尺寸变 0）。
 - **想看错误现场**：加 `JLC_HEADLESS=0`，或给 `test_captcha.py` 加 `--keep`，浏览器不会自动关，可以直接在窗口里操作。
 

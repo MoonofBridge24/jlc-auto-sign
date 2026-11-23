@@ -38,6 +38,21 @@ class ApiError(Exception):
     """接口调用失败（网络、WAF、业务错误等），不一定需要重新登录"""
 
 
+def _reason_of(resp):
+    """把 401 响应体里的 msg 提取出来，日志里能看到服务端真实原因"""
+    try:
+        payload = resp.json()
+    except ValueError:
+        text = (resp.text or "").strip().replace("\n", " ")
+        return text[:80] or "无响应体"
+    if isinstance(payload, dict):
+        for key in ("msg", "message", "error", "errorMsg"):
+            value = payload.get(key)
+            if value:
+                return str(value)[:80]
+    return "未登录或凭证失效"
+
+
 class _BaseClient(object):
     def __init__(self, index=0, logger=None, timeout=15, retries=2):
         self.index = index
@@ -66,7 +81,7 @@ class _BaseClient(object):
                 raise ApiError(last_error)
 
             if resp.status_code == 401:
-                raise AuthExpired("接口返回 401，未登录或凭证失效")
+                raise AuthExpired("接口返回 401（%s）" % _reason_of(resp))
             if resp.status_code == 418:
                 raise ApiError("418 被 WAF 拦截（请求头指纹被判定为自动化）")
             if resp.status_code >= 500:
@@ -96,18 +111,25 @@ class OshwhubClient(_BaseClient):
 
     BASE = "https://oshwhub.com"
 
-    def __init__(self, cookies, index=0, logger=None):
+    def __init__(self, cookies, index=0, logger=None, cookie_header="", ua=""):
         super(OshwhubClient, self).__init__(index=index, logger=logger)
         self.cookies = dict(cookies or {})
         self.session.headers.update({
-            "User-Agent": DESKTOP_UA,
+            "User-Agent": ua or DESKTOP_UA,
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Referer": "https://oshwhub.com/sign_in",
             "Origin": "https://oshwhub.com",
+            # 站内接口是 XHR 调用，老脚本都带这个头；缺了会被当成非站内请求
+            "X-Requested-With": "XMLHttpRequest",
         })
-        for name, value in self.cookies.items():
-            self.session.cookies.set(name, value, domain="oshwhub.com")
+        if cookie_header:
+            # 直接用浏览器发出去的那串 Cookie：既能带全 WAF 会话 Cookie，
+            # 也不会因为 cookiejar 的域名/路径匹配规则漏发。
+            self.session.headers["Cookie"] = cookie_header
+        else:
+            for name, value in self.cookies.items():
+                self.session.cookies.set(name, value, domain="oshwhub.com")
 
     def _api(self, method, path):
         url = self.BASE + path
