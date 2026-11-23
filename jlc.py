@@ -1421,7 +1421,8 @@ def sign_in_account(username, password, account_index, total_accounts,
         retry_label = " (重试%s)" % retry_count
     if is_final_retry:
         retry_label = " (最终重试)"
-    log("开始处理账号 %s/%s%s" % (account_index, total_accounts, retry_label))
+    log("开始处理账号 %s/%s（%s）%s" % (
+        account_index, total_accounts, mask_account(username), retry_label))
 
     result = _empty_account_result(account_index, retry_count, is_final_retry)
 
@@ -1985,22 +1986,24 @@ def main():
         raw = os.getenv(name, "") or ""
         return [x.strip() for x in re.split(r"[,\n;]+", raw) if x.strip()]
 
-    if len(sys.argv) >= 3:
-        usernames = [u.strip() for u in sys.argv[1].split(',') if u.strip()]
-        passwords = [p.strip() for p in sys.argv[2].split(',') if p.strip()]
-        failure_flag = sys.argv[3] if len(sys.argv) >= 4 else ''
-    else:
-        # 没传命令行参数时读环境变量，本地调试不必把密码写进命令历史
-        usernames = _split_env("JLC_USERNAME")
-        passwords = _split_env("JLC_PASSWORD")
-        failure_flag = os.getenv("JLC_FAIL_EXIT", "")
-        if not usernames or not passwords:
-            print("用法: python jlc.py 账号1,账号2,账号3... 密码1,密码2,密码3... [失败退出标志]")
-            print("示例: python jlc.py user1,user2,user3 pwd1,pwd2,pwd3")
-            print("示例: python jlc.py user1,user2,user3 pwd1,pwd2,pwd3 true")
-            print("或改用环境变量: JLC_USERNAME=账号1,账号2  JLC_PASSWORD=密码1,密码2  JLC_FAIL_EXIT=true")
-            print("失败退出标志: true/1/yes/on-开启(任意账号签到失败时返回非零退出码), 其他-关闭")
-            sys.exit(1)
+    # 账号来源：命令行参数优先，其次环境变量（Actions 里走环境变量，见下方说明）
+    arg_users = [u.strip() for u in sys.argv[1].split(',')] if len(sys.argv) >= 2 else []
+    arg_pwds = [p.strip() for p in sys.argv[2].split(',')] if len(sys.argv) >= 3 else []
+    usernames = [u for u in arg_users if u] or _split_env("JLC_USERNAME")
+    passwords = [p for p in arg_pwds if p] or _split_env("JLC_PASSWORD")
+
+    # 失败退出标志：命令行第 3 个参数 > 环境变量。
+    # 之前这里写成「只有没传参数时才读环境变量」，而工作流是带参数调用的，
+    # 于是 JLC_FAIL_EXIT=true 被无声丢掉，失败也不会让 action 变红。
+    failure_flag = (sys.argv[3] if len(sys.argv) >= 4 else '') or os.getenv("JLC_FAIL_EXIT", "")
+
+    if not usernames or not passwords:
+        print("用法: python jlc.py 账号1,账号2,账号3... 密码1,密码2,密码3... [失败退出标志]")
+        print("示例: python jlc.py user1,user2,user3 pwd1,pwd2,pwd3")
+        print("示例: python jlc.py user1,user2,user3 pwd1,pwd2,pwd3 true")
+        print("或改用环境变量: JLC_USERNAME=账号1,账号2  JLC_PASSWORD=密码1,密码2  JLC_FAIL_EXIT=true")
+        print("失败退出标志: true/1/yes/on-开启(任意账号签到失败时返回非零退出码), 其他-关闭")
+        sys.exit(1)
 
     # 失败退出标志：任意账号签到失败时返回非零退出码（Actions 会据此发失败邮件）
     enable_failure_exit = (failure_flag or '').strip().lower() in ('1', 'true', 'yes', 'on')

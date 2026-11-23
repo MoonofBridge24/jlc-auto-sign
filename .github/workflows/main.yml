@@ -36,6 +36,10 @@ jobs:
 
       - name: 'Working'
         env:
+          # 账号密码走环境变量而不是命令行参数：secret 出现在命令行会被日志整段打码成 ***，
+          # 连无关的数字也可能被一起遮掉，排错时完全看不出跑到第几个账号
+          JLC_USERNAME: ${{ secrets.JLC_USERNAME }}
+          JLC_PASSWORD: ${{ secrets.JLC_PASSWORD }}
           # 上次运行留下的凭证（JSON）。为空时本次会走浏览器登录
           JLC_CREDENTIALS: ${{ secrets.JLC_CREDENTIALS }}
           # Server酱3 推送（可选）：不配置该 secret 则跳过推送
@@ -44,7 +48,7 @@ jobs:
           # 任意账号签到失败 → 这一步失败，Actions 会标红并发送失败通知邮件
           JLC_FAIL_EXIT: 'true'
         run: |
-          python ./jlc.py ${{ secrets.JLC_USERNAME }} ${{ secrets.JLC_PASSWORD }}
+          python ./jlc.py
 
       - name: 'Update credential secret'
         # 登录拿到的 Cookie / Token 回写到 JLC_CREDENTIALS，下次运行可跳过浏览器
