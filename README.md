@@ -53,7 +53,7 @@ Github Actions 单次任务执行时长限制在 6 小时以内，即使每个�
 这样即使无头浏览器被风控、或者 Actions 上启动浏览器很慢，只要凭证还有效，签到本身几乎不受影响。
 凭证失效（401）时才会重新走一次浏览器登录。
 
-取凭证这一步有三个坑，代码里都已处理，排错时可以对照：
+取凭证这一步有几个坑，代码里都已处理，排错时可以对照：
 
 1. **SSO 回跳成功 ≠ 登录态已生效。** 从 passport 跳回 `oshwhub.com` 时 URL 已经变了，
    但 session Cookie 是页面再发一次请求之后才写进去的。只看 URL 就取 Cookie 会拿到
@@ -61,7 +61,14 @@ Github Actions 单次任务执行时长限制在 6 小时以内，即使每个�
 2. **`m.jlc.com` 必须用移动端 UA 访问。** 桌面 UA 会被强制 302 到 `www.jlc.com`（PC 站），
    PC 站前端不保存 `X-JLC-AccessToken`，怎么翻 localStorage 都拿不到。脚本用 CDP 把 UA
    切成移动端（连 UA-CH 的 `mobile: true` 一起改）再进站取 token，取完切回桌面 UA。
-3. **Cookie 要整串带走。** 登录态分散在 `oshwhub_session`、`oshwhub_csrf`、`isLoginCustomerFlag`、
+   切完会打印 `当前 UA: 移动端 ✓`，没切成功会打印真实 UA。
+3. **金豆用的是另一个 appId（`JLC_MOBILE_APP`），光登录 oshwhub 不够。**
+   只登过 `JLC_OSHWHUB` 时，m.jlc.com 的请求头里 `X-JLC-AccessToken` 是字符串 `null`，
+   签到就是 `401（用户未登录或会话失效）`。所以取 token 时还会走一次
+   `passport.jlc.com/m/login?appId=JLC_MOBILE_APP`——passport 有会话时它是静默跳转，
+   不会二次输密码——回跳后 token 才会写进 localStorage。拿到后还会调一次资产接口校验，
+   `null` 这种假值不会被存进 secret。
+4. **Cookie 要整串带走。** 登录态分散在 `oshwhub_session`、`oshwhub_csrf`、`isLoginCustomerFlag`、
    `jlc_customer_code` 等多个 Cookie 里，只留名字带 `session` 的会缺信息。请求时优先发浏览器
    原样的 Cookie 头，被拒再退回「只用会话 Cookie」重试一次（缓存里的 WAF Cookie 可能属于旧 IP）。
 
