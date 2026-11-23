@@ -140,21 +140,57 @@ python test_captcha.py --fake            # 用假账号触发验证码，只看�
 
 ---
 
-### 2.1 配置凭证回写（强烈推荐）
+### 2.1 配置凭证持久化（强烈推荐）
 
-登录成功后脚本会提取 Cookie 和 `X-JLC-AccessToken`，写到 `credentials.json`；
-工作流最后一步再用 `gh secret set` 把它回写到 **`JLC_CREDENTIALS`**。
-下一次运行优先读这份缓存，凭证有效就完全不启动浏览器。
+登录成功后脚本会提取 Cookie 和 `X-JLC-AccessToken`，写到 `credentials.json`。
+下一次运行优先用这份缓存，凭证有效就完全不启动浏览器。缓存靠两条通道传递，任意一条可用即可：
 
-需要两个 secret：
+| 通道 | 怎么工作 | 需要什么 |
+| --- | --- | --- |
+| **Secret**（主） | 最后一步用 `gh secret set` 写入 `JLC_CREDENTIALS`，下次运行由 `env` 注入 | `JLC_SECRET_PAT` |
+| **Actions 缓存**（备） | `actions/cache` 保存/还原 `credentials.json` | 无需额外配置，缓存可能被 GitHub 淘汰 |
 
-| Name | 说明 |
+脚本会把两边的凭证都读出来，按 `updated_at` **每个账号各取较新的一份**，
+所以 secret 落后时不会覆盖掉缓存里的新凭证；发现 secret 落后还会顺手回写一次（自愈）。
+
+#### 创建 `JLC_SECRET_PAT`
+
+1. 打开 <https://github.com/settings/tokens> → **Generate new token**
+   - **Classic**：勾选 `repo`（私有仓库必需）和 `workflow` 即可，`admin:repo_hook` 不用
+   - **Fine-grained**：Repository access 选本仓库，Permissions → **Secrets: Read and write**
+2. 复制生成的 token
+3. 仓库 → **Settings → Secrets and variables → Actions → New repository secret**
+   - Name: `JLC_SECRET_PAT`
+   - Secret: 粘贴 token
+
+`JLC_CREDENTIALS` 第一次不用建，跑完会自动创建；之后不要手工改它。
+
+#### 怎么确认真的保存了
+
+运行结束后看 `Update credential secret` 这一步的日志：
+
+```
+凭证文件大小: 1653 字节
+updated_at: 2026-11-23 18:55:29
+账号数: 1
+  - 18894880045 cookies: 12 token: 有
+凭证已回写
+JLC_CREDENTIALS    2026-11-23 18:56:07
+```
+
+最后那行是 `gh secret list` 的输出，冒号后面是 secret 的更新时间。
+下次运行如果日志里出现 `账号 1 - 缓存凭证可用，未启动浏览器`，说明持久化生效了。
+
+#### 常见的「没保存」原因
+
+| 日志现象 | 原因 |
 | --- | --- |
-| `JLC_CREDENTIALS` | 凭证 JSON。第一次可以不创建（脚本会自动生成并回写），之后不要手工改 |
-| `JLC_SECRET_PAT` | 有权限修改本仓库 Secrets 的 PAT。经典 PAT 勾 `repo`；fine-grained PAT 勾 `Secrets: Read and write` |
+| `未配置 JLC_SECRET_PAT，JLC_CREDENTIALS 不会更新` | 没加 `JLC_SECRET_PAT`，或加在了 Environment 里而工作流没指定 environment |
+| `凭证回写失败` | PAT 过期 / 无本仓库 Secrets 写权限 / 是只读的 fork |
+| `工作区里没有 credentials.json` | 本次用的是已有凭证且未失效，本来就没必要回写（正常） |
+| 回写成功但下次仍登录 | 凭证已真正过期（Cookie 一般几天到一周），或换了 IP/UA 被判定为新设备 |
 
-不配置 `JLC_SECRET_PAT` 也能正常签到，只是每次运行都会重新登录一次（多账号时比较慢）。
-凭证只存在 secret 里，不会进 git（`credentials.json` 已在 `.gitignore` 中）。
+凭证只存在 secret / cache 里，不会进 git（`credentials.json` 已在 `.gitignore` 中）。
 
 ---
 
@@ -311,7 +347,8 @@ python jlc.py            # 自动读 JLC_USERNAME / JLC_PASSWORD
 | `SERVERCHAN3_SCKEY` | Server酱3 推送 key，多个用逗号分隔 | `sctp111tAAA` |
 
 本地第一次运行会走浏览器登录，把凭证写入 `credentials.json`；之后再运行会直接复用，
-想强制重新登录就删掉这个文件即可。
+想强制重新登录就删掉这个文件即可（环境变量 `JLC_CREDENTIALS` 和文件会按账号各取较新的一份，
+所以设了环境变量也不用删文件）。
 
 注意：`JLC_HEADLESS=0` 表示「显示窗口」，没有 `JLC_HEADFUL` 这个变量。
 

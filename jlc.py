@@ -399,49 +399,100 @@ def _now_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def load_credential_cache():
+def _parse_credential_payload(raw, label):
     """
-    读取上次运行留下的凭证：优先环境变量 JLC_CREDENTIALS（工作流从 secret 注入），
-    其次本地 credentials.json。格式：
+    解析一份凭证 JSON。格式：
         {"version": 1, "accounts": {"用户名": {"cookies": {...}, "access_token": "..."}}}
     没有 accounts 层时，直接当成「用户名 -> 凭证」的映射，方便手工填写。
     """
-    global credential_loaded
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        log("凭证缓存: %s 内容不是合法 JSON，忽略" % label)
+        return {}
+
+    accounts = data.get("accounts") if isinstance(data, dict) and "accounts" in data else data
+    if not isinstance(accounts, dict):
+        return {}
+
+    result = {}
+    for username, cred in accounts.items():
+        if isinstance(cred, dict):
+            result[str(username)] = cred
+    return result
+
+
+def _cred_updated_at(cred):
+    return (cred or {}).get("updated_at") or ""
+
+
+def load_credential_cache():
+    """
+    读取上次运行留下的凭证，两个来源都读，然后按账号取「更新得比较新」的那份：
+
+    - 环境变量 JLC_CREDENTIALS（工作流从 secret 注入）；
+    - 本地 credentials.json（工作流里由 actions/cache 还原）。
+
+    之所以要合并：secret 回写需要 PAT，PAT 没配或没权限时 secret 会一直是旧的，
+    而 cache 里的凭证是新的；反过来 cache 被 GitHub 淘汰时 secret 还在。
+    两边都在就不会互相拖后腿。
+    """
+    global credential_loaded, credential_dirty
     if credential_loaded:
         return credential_cache
     credential_loaded = True
 
-    raw = (os.getenv("JLC_CREDENTIALS") or "").strip()
-    source = "环境变量 JLC_CREDENTIALS"
+    sources = []
 
-    if not raw and CREDENTIAL_FILE and os.path.exists(CREDENTIAL_FILE):
+    env_raw = (os.getenv("JLC_CREDENTIALS") or "").strip()
+    env_accounts = _parse_credential_payload(env_raw, "secret JLC_CREDENTIALS")
+    if env_accounts:
+        sources.append(("secret", env_accounts))
+    elif not env_raw:
+        log("凭证缓存: secret JLC_CREDENTIALS 为空")
+
+    file_accounts = {}
+    if CREDENTIAL_FILE and os.path.exists(CREDENTIAL_FILE):
         try:
             with open(CREDENTIAL_FILE, "r", encoding="utf-8") as fp:
-                raw = fp.read()
-            source = CREDENTIAL_FILE
+                file_accounts = _parse_credential_payload(fp.read(), CREDENTIAL_FILE)
         except Exception as e:
             log("凭证缓存: 读取 %s 失败: %s" % (CREDENTIAL_FILE, e))
-            raw = ""
+        if file_accounts:
+            sources.append((CREDENTIAL_FILE, file_accounts))
+    else:
+        log("凭证缓存: 本地没有 %s" % (CREDENTIAL_FILE,))
 
-    if not raw:
-        log("凭证缓存: 未找到，本次需要登录")
+    if not sources:
+        log("凭证缓存: 未找到可用凭证，本次需要登录")
         return credential_cache
 
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        log("凭证缓存: 内容不是合法 JSON，本次需要登录")
-        return credential_cache
+    # 同一个账号两边都有时，取 updated_at 更新的那份（时间格式可字典序比较）
+    taken_from = {}
+    for label, accounts in sources:
+        for username, cred in accounts.items():
+            current = credential_cache.get(username)
+            if current is None or _cred_updated_at(cred) > _cred_updated_at(current):
+                credential_cache[username] = cred
+                taken_from[username] = label
 
-    accounts = data.get("accounts") if isinstance(data, dict) and "accounts" in data else data
-    if not isinstance(accounts, dict):
-        accounts = {}
+    detail = "、".join("%s %d 个" % (label, len(accounts)) for label, accounts in sources)
+    log("凭证缓存: 载入 %d 个账号（%s）" % (len(credential_cache), detail))
+    for username, label in taken_from.items():
+        log("凭证缓存: 账号 %s 使用 %s 里的凭证（%s）" % (
+            mask_account(username), label,
+            _cred_updated_at(credential_cache.get(username)) or "时间未知"))
 
-    for username, cred in accounts.items():
-        if isinstance(cred, dict):
-            credential_cache[str(username)] = cred
-
-    log("凭证缓存: 已从 %s 载入 %d 个账号" % (source, len(credential_cache)))
+    # 有账号用的是本地文件里的新凭证，说明 secret 落后了（多半是没配 PAT 或回写失败）。
+    # 标记为「有更新」，让这次跑完照样写文件、再尝试回写 secret，做到自愈。
+    if any(label != "secret" for label in taken_from.values()):
+        credential_dirty = True
+        if env_accounts:
+            log("凭证缓存: secret 里的凭证比本地文件旧，本次会重新回写")
+        else:
+            log("凭证缓存: 只有本地文件里有凭证，本次会顺手回写到 secret")
     return credential_cache
 
 
@@ -503,8 +554,13 @@ def save_credential_cache(usernames=None):
         log("凭证缓存: 写入 %s 失败: %s" % (CREDENTIAL_FILE, e))
         return None
 
-    log("凭证缓存: 已更新 %d 个账号 → %s（工作流会回写到 secret）" % (
-        len(accounts), CREDENTIAL_FILE))
+    try:
+        size = os.path.getsize(CREDENTIAL_FILE)
+    except OSError:
+        size = -1
+
+    log("凭证缓存: 已更新 %d 个账号 → %s（%d 字节，工作流会回写到 secret）" % (
+        len(accounts), CREDENTIAL_FILE, size))
     return CREDENTIAL_FILE
 
 

@@ -34,6 +34,15 @@ jobs:
       - name: Prepare chromedriver
         uses: nanasess/setup-chromedriver@v2
 
+      # 备用持久化：secret 回写需要 PAT，没配的时候凭证还能靠 Actions 缓存跨次传递
+      - name: 'Restore credential cache'
+        uses: actions/cache/restore@v4
+        with:
+          path: credentials.json
+          key: jlc-credentials-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            jlc-credentials-
+
       - name: 'Working'
         env:
           # 上次运行留下的凭证（JSON）。为空时本次会走浏览器登录
@@ -44,21 +53,39 @@ jobs:
         run: |
           python ./jlc.py ${{ secrets.JLC_USERNAME }} ${{ secrets.JLC_PASSWORD }}
 
+      - name: 'Inspect credential file'
+        id: creds
+        if: always()
+        run: |
+          if [ -s credentials.json ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "凭证文件大小: $(wc -c < credentials.json) 字节"
+            python -c "import json;d=json.load(open('credentials.json',encoding='utf-8'));a=d.get('accounts') or {};print('updated_at:',d.get('updated_at'));print('账号数:',len(a));[print('  -',k,'cookies:',len(v.get('cookies') or {}),'token:','有' if v.get('access_token') else '无') for k,v in a.items()]"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "工作区里没有 credentials.json（本次没拿到新凭证，且缓存里也没有）"
+          fi
+
       - name: 'Update credential secret'
         # 登录拿到的 Cookie / Token 在下一次运行时可以复用，省掉一次浏览器登录
-        if: always()
+        if: always() && steps.creds.outputs.exists == 'true'
         env:
           GH_TOKEN: ${{ secrets.JLC_SECRET_PAT }}
         run: |
-          if [ -z "$GH_TOKEN" ]; then
-            echo "未配置 JLC_SECRET_PAT，跳过凭证回写（下次运行会重新登录）"
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning title=凭证未回写::未配置 JLC_SECRET_PAT，JLC_CREDENTIALS 不会更新；凭证只留在 Actions 缓存里（缓存可能被淘汰，建议配 PAT）"
             exit 0
           fi
-          if [ ! -s credentials.json ]; then
-            echo "本次没有产生新凭证，跳过回写"
-            exit 0
+          if gh secret set JLC_CREDENTIALS --repo "$GITHUB_REPOSITORY" < credentials.json; then
+            echo "::notice title=凭证已回写::JLC_CREDENTIALS 已更新，下次运行可直接复用"
+            gh secret list --repo "$GITHUB_REPOSITORY" | grep -i JLC_CREDENTIALS || true
+          else
+            echo "::error title=凭证回写失败::检查 JLC_SECRET_PAT 是否过期、是否对本仓库有 Secrets 写权限（经典 PAT 需 repo，fine-grained 需 Secrets: Read and write）"
           fi
-          gh secret set JLC_CREDENTIALS < credentials.json \
-            && echo "已更新 JLC_CREDENTIALS" \
-            || echo "凭证回写失败（检查 JLC_SECRET_PAT 是否有 Secrets 写权限），本次签到结果不受影响"
-          rm -f credentials.json
+
+      - name: 'Save credential cache'
+        if: always() && steps.creds.outputs.exists == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: credentials.json
+          key: jlc-credentials-${{ github.run_id }}-${{ github.run_attempt }}
