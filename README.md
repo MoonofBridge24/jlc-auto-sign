@@ -1,4 +1,5 @@
-# 嘉立创自动签到工具  
+# 嘉立创自动签到工具
+
 *By zhangMonday*
 
 [立创开源平台](https://oshwhub.com/)
@@ -8,13 +9,14 @@
 请确保你的立创账号已经在开源平台设置了昵称，否则开源平台自动签到将无法运行
 
 使用缓存凭证时，每个账号只发几次接口请求，通常几秒完成；只有凭证失效需要登录时才要 1~2 分钟（含滑块）。
-当天（东八区）已经签到完成的账号会被直接跳过，一个请求都不发。
+当天已经签到完成的账号会被直接跳过，一个请求都不发。
 Github Actions 单次任务执行时长限制在 6 小时以内，即使每个账号都重新登录，也不建议设置超过 70 个账号。
 如果有大量账号自动签到需求，可以手动多克隆几个本仓库来批量运行。
 
 ---
 
-## 项目简介  
+## 项目简介
+
 该项目利用 **Github Actions** 实现立创开源平台以及立创金豆的每天自动化签到
 
 支持多账号签到
@@ -36,7 +38,7 @@ Github Actions 单次任务执行时长限制在 6 小时以内，即使每个�
 ```
 读取 JLC_CREDENTIALS(secret)
         │
-        ├──今天（东八区）已全部签完──> 直接跳过该账号，不发请求
+        ├──今天已全部签完──> 直接跳过该账号，不发请求
         │
         └──有缓存──> 接口校验/直接签到
         │              │
@@ -49,12 +51,12 @@ Github Actions 单次任务执行时长限制在 6 小时以内，即使每个�
                                   有新签到记录才推送签到总结
 ```
 
-| 环节 | 实现方式 | 凭证 |
-| --- | --- | --- |
-| 登录 | Selenium + 阿里云滑块 | 账号密码 |
-| 开源平台积分签到 | `GET/POST https://oshwhub.com/api/users*` | Cookie（整串，关键 `oshwhub_session`） |
-| 开源平台签到好礼 | `https://oshwhub.com/api/gift/goodGift[/{uuid}]` | 同上 |
-| 嘉立创金豆签到 | `https://m.jlc.com/api/activity/sign/*` | 请求头 `X-JLC-AccessToken` |
+| 环节             | 实现方式                                           | 凭证                                     |
+| ---------------- | -------------------------------------------------- | ---------------------------------------- |
+| 登录             | Selenium + 阿里云滑块                              | 账号密码                                 |
+| 开源平台积分签到 | `GET/POST https://oshwhub.com/api/users*`        | Cookie（整串，关键 `oshwhub_session`） |
+| 开源平台签到好礼 | `https://oshwhub.com/api/gift/goodGift[/{uuid}]` | 同上                                     |
+| 嘉立创金豆签到   | `https://m.jlc.com/api/activity/sign/*`          | 请求头 `X-JLC-AccessToken`             |
 
 这样即使无头浏览器被风控、或者 Actions 上启动浏览器很慢，只要凭证还有效，签到本身几乎不受影响。
 凭证失效（401）时才会重新走一次浏览器登录。
@@ -95,7 +97,6 @@ Github Actions 单次任务执行时长限制在 6 小时以内，即使每个�
 
 推送里会带上 `含七日好礼` / `含七日好礼（优惠券）`，失败时是 `七日好礼领取失败（原因）`。
 
-
 ---
 
 ## 关于滑块验证（阿里云验证码 2.0）
@@ -122,10 +123,10 @@ Github Actions 单次任务执行时长限制在 6 小时以内，即使每个�
 
 可用环境变量（本地调试用）：
 
-| 变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `JLC_HEADLESS` | `1` | 设为 `0` 打开浏览器窗口，方便肉眼看拖拽过程 |
-| `JLC_BROWSER` | `chrome` | 本地没有 Chrome 时可设为 `edge` |
+| 变量             | 默认       | 说明                                          |
+| ---------------- | ---------- | --------------------------------------------- |
+| `JLC_HEADLESS` | `1`      | 设为 `0` 打开浏览器窗口，方便肉眼看拖拽过程 |
+| `JLC_BROWSER`  | `chrome` | 本地没有 Chrome 时可设为 `edge`             |
 
 本地单独验证滑块（不跑签到）：
 
@@ -139,21 +140,22 @@ python test_captcha.py --fake            # 用假账号触发验证码，只看�
 
 ---
 
-## 配置方法  
+## 配置方法
 
-### 1. Fork 项目到自己的仓库  
-- 访问项目页面，点击 `Fork` 按钮将项目复制到自己的仓库。  
+### 1. Fork 项目到自己的仓库
+
+- 访问项目页面，点击 `Fork` 按钮将项目复制到自己的仓库。
 
 ![步骤1](img/1.jpg)
 
 ---
 
-### 2. 配置嘉立创账号和密码  
-1. 进入你 Fork 的仓库，点击 **Settings** → **Secrets** → **New repository secret**。  
-2. 添加以下两个密钥：  
-   - **Name**: `JLC_USERNAME`  
-     **Value**: 你的嘉立创登录账户邮箱/手机号/客编，多账号用英文逗号分割，要和密码一一对应
-   - **Name**: `JLC_PASSWORD`  
+### 2. 配置嘉立创账号和密码
+
+1. 进入你 Fork 的仓库，点击 **Settings** → **Secrets** → **New repository secret**。
+2. 添加以下两个密钥：
+   - **Name**: `JLC_USERNAME`**Value**: 你的嘉立创登录账户邮箱/手机号/客编，多账号用英文逗号分割，要和密码一一对应
+   - **Name**: `JLC_PASSWORD`
      **Value**: 你的嘉立创登录密码，多账号用英文逗号分割，要和账号一一对应
 
 ![步骤2](img/2.jpg)
@@ -171,7 +173,7 @@ python test_captcha.py --fake            # 用假账号触发验证码，只看�
 secret 里每个账号存两类东西：
 
 - **登录凭证**：`cookies` / `cookie_header` / `access_token` / `ua` / `updated_at`；
-- **签到记录** `last_sign`：最近一次「积分 + 金豆都成功」的**东八区**时间、余额和领到的权益：
+- **签到记录** `last_sign`：最近一次「积分 + 金豆都成功」的时间、余额和领到的权益：
 
   ```json
   "last_sign": {
@@ -181,7 +183,7 @@ secret 里每个账号存两类东西：
   }
   ```
 
-工作流每天跑两次，但同一个东八区自然日内只要该账号的 `complete` 是 `true`，就会**直接跳过**：
+工作流每天跑两次，但同一个自然日内只要该账号的 `complete` 是 `true`，就会**直接跳过**：
 不发任何签到请求、不启动浏览器，日志显示 `⏭️ 账号(...)：今日已完成（08:15），积分 145；金豆 10`。
 所以第二个 cron 时段基本只是确认状态，不会重复签到；跨天后 `date` 不匹配，自动恢复正常签到。
 只成功一侧时 `complete` 为 `false`，下次运行仍会补跑缺失的那一侧。
@@ -190,7 +192,7 @@ secret 里每个账号存两类东西：
 
 `gh` 修改 secret 不能用 Actions 自带的 `GITHUB_TOKEN`，必须用 PAT：
 
-1. 打开 <https://github.com/settings/tokens> → **Generate new token**
+1. 打开 [https://github.com/settings/tokens](https://github.com/settings/tokens) → **Generate new token**
    - **Classic**：勾 `repo`（私有仓库必需）和 `workflow`
    - **Fine-grained**：Repository access 选本仓库，Permissions → **Secrets: Read and write**
 2. 仓库 → **Settings → Secrets and variables → Actions → New repository secret**
@@ -214,12 +216,12 @@ updated_at: 2026-11-23 18:55:29 | 账号数: 1
 
 #### 没保存成功时的对照
 
-| 日志现象 | 原因 |
-| --- | --- |
-| `本次没有产生新凭证，跳过回写` | 本次用的是仍未失效的旧凭证，本来就不需要写（正常） |
-| `未配置 JLC_SECRET_PAT` | 没建这个 secret，或建在了 Environment 里 |
-| `凭证回写失败` | PAT 过期 / 无本仓库 Secrets 写权限 / 只读 fork |
-| 回写成功但下次仍登录 | 凭证已过期（Cookie 一般几天到一周），或换 IP 被判定新设备 |
+| 日志现象                         | 原因                                                      |
+| -------------------------------- | --------------------------------------------------------- |
+| `本次没有产生新凭证，跳过回写` | 本次用的是仍未失效的旧凭证，本来就不需要写（正常）        |
+| `未配置 JLC_SECRET_PAT`        | 没建这个 secret，或建在了 Environment 里                  |
+| `凭证回写失败`                 | PAT 过期 / 无本仓库 Secrets 写权限 / 只读 fork            |
+| 回写成功但下次仍登录             | 凭证已过期（Cookie 一般几天到一周），或换 IP 被判定新设备 |
 
 #### 失败通知
 
@@ -229,8 +231,9 @@ Server酱3 推送在退出前完成，所以消息照常能收到。
 
 ---
 
-### 3. 配置 Actions 自动化执行  
-1. 在你 Fork 的 GitHub 仓库中点击 **Actions**  
+### 3. 配置 Actions 自动化执行
+
+1. 在你 Fork 的 GitHub 仓库中点击 **Actions**
 2. 按照图示方法启用 GitHub Actions
 
 ![步骤3](img/3.png)
@@ -241,8 +244,9 @@ Server酱3 推送在退出前完成，所以消息照常能收到。
 
 ---
 
-### 4. 定时自动化执行  
-在 `.github/workflows/main.yml` 文件中，根据注释修改自动签到时间。  
+### 4. 定时自动化执行
+
+在 `.github/workflows/main.yml` 文件中，根据注释修改自动签到时间。
 如果不修改，默认自动签到时间为北京时间早上 7 点（23:00 UTC）和晚上 19 点（11:00 UTC）
 
 实际运行时间会比设置时间延迟一小时以内，具体取决于当时 GitHub 资源占用情况。
@@ -301,13 +305,13 @@ SERVERCHAN3_SCKEY=sctp111tAAA,sctp222tBBB
 
 分配规则：
 
-| 情况 | 结果 |
-| --- | --- |
-| 不配置 | 不推送 |
-| 只配一个 `sctp111tAAA` | 所有账号合并成 **一条** 推送 |
-| 配两个，共 3 个账号 | 账号 1 用第 1 个、账号 2 用第 2 个、账号 3 回落到第 1 个 |
-| 中间留空 `sctp111tAAA,,sctp333tCCC` | 账号 2 回落到第 1 个 |
-| 多个账号共用同一个 SendKey | 结果合并成 **一条** 推送，不会重复发 |
+| 情况                                  | 结果                                                     |
+| ------------------------------------- | -------------------------------------------------------- |
+| 不配置                                | 不推送                                                   |
+| 只配一个 `sctp111tAAA`              | 所有账号合并成 **一条** 推送                       |
+| 配两个，共 3 个账号                   | 账号 1 用第 1 个、账号 2 用第 2 个、账号 3 回落到第 1 个 |
+| 中间留空 `sctp111tAAA,,sctp333tCCC` | 账号 2 回落到第 1 个                                     |
+| 多个账号共用同一个 SendKey            | 结果合并成 **一条** 推送，不会重复发               |
 
 推送内容（同一 SendKey 下的账号合并成一条，正文每行之间留空行，适配 Server酱3 的 markdown 渲染）：
 
@@ -395,16 +399,16 @@ python jlc.py            # 自动读 JLC_USERNAME / JLC_PASSWORD
 
 #### 4. 环境变量一览
 
-| 变量 | 作用 | 示例 |
-| --- | --- | --- |
-| `JLC_USERNAME` | 账号，多个用逗号分隔 | `13800138000,abc@qq.com` |
-| `JLC_PASSWORD` | 密码，与账号一一对应 | `pwd1,pwd2` |
-| `JLC_BROWSER` | 浏览器，`chrome` 或 `edge` | `edge` |
-| `JLC_HEADLESS` | 设为 `0` 显示浏览器窗口（默认无头） | `0` |
-| `JLC_FAIL_EXIT` | 设为 `true`/`1`/`yes` 时任意账号失败返回非零退出码（工作流已默认开启） | `true` |
-| `JLC_CREDENTIALS` | 上次运行留下的凭证 JSON（工作流从 secret 注入） | `{"accounts":{...}}` |
-| `JLC_CREDENTIAL_FILE` | 凭证中转文件路径，默认 `credentials.json`（本地调试用） | `credentials.json` |
-| `SERVERCHAN3_SCKEY` | Server酱3 推送 key，多个用逗号分隔 | `sctp111tAAA` |
+| 变量                    | 作用                                                                         | 示例                       |
+| ----------------------- | ---------------------------------------------------------------------------- | -------------------------- |
+| `JLC_USERNAME`        | 账号，多个用逗号分隔                                                         | `13800138000,abc@qq.com` |
+| `JLC_PASSWORD`        | 密码，与账号一一对应                                                         | `pwd1,pwd2`              |
+| `JLC_BROWSER`         | 浏览器，`chrome` 或 `edge`                                               | `edge`                   |
+| `JLC_HEADLESS`        | 设为 `0` 显示浏览器窗口（默认无头）                                        | `0`                      |
+| `JLC_FAIL_EXIT`       | 设为 `true`/`1`/`yes` 时任意账号失败返回非零退出码（工作流已默认开启） | `true`                   |
+| `JLC_CREDENTIALS`     | 上次运行留下的凭证 JSON（工作流从 secret 注入）                              | `{"accounts":{...}}`     |
+| `JLC_CREDENTIAL_FILE` | 凭证中转文件路径，默认 `credentials.json`（本地调试用）                    | `credentials.json`       |
+| `SERVERCHAN3_SCKEY`   | Server酱3 推送 key，多个用逗号分隔                                           | `sctp111tAAA`            |
 
 本地第一次运行会走浏览器登录，把凭证写入 `credentials.json`；之后再运行会直接复用，
 想强制重新登录就删掉这个文件即可（环境变量 `JLC_CREDENTIALS` 和文件会按账号各取较新的一份，
@@ -447,7 +451,7 @@ JLC_BROWSER=edge JLC_HEADLESS=0 JLC_USERNAME=13800138000 JLC_PASSWORD=你的密�
 
 - **卡在「页面未自动跳转」**：签到页里拿不到可见的登录链接，通常是网络慢、页面还没渲染完。脚本会等 12 秒，再退到默认的 passport 登录地址；仍然失败时会打印当前 URL，配合 `debug/` 截图排查。
 - **日志说「使用缓存凭证，未启动浏览器」**：正常。说明上次留下的 Cookie/Token 还有效，签到全部走接口。
-- **日志说「东八区今天…积分与金豆均已完成，跳过签到」**：正常。secret 里已有当天完成记录，
+- **日志说「今天…积分与金豆均已完成，跳过签到」**：正常。secret 里已有当天完成记录，
   本次不请求接口也不推送。想强制重跑一次，就删掉 secret 里该账号的 `last_sign` 或把 `date` 改成别的日期。
 - **日志说「缓存凭证不可用」**：Cookie 或 Token 过期了（通常是手动退出过账号），脚本会自动重新登录并刷新 secret，无需处理。
 - **只失败金豆 / 只失败积分**：看日志里的原因。`凭证失效` 会自动重登；`418 被 WAF 拦截` 是请求被风控，重试通常能过；`success=false` 一般是当天接口限流或活动变更。
@@ -495,9 +499,11 @@ GitHub Actions（ubuntu-22.04 + Chrome + selenium 3.141）额外注意：
 ---
 
 ### 成功运行结果（节选）
+
 ![成功运行结果](img/6.png)
 
-## 致谢  
+## 致谢
+
 本项目参考和复用了 [https://github.com/wmathor/Check_In](https://github.com/wmathor/Check_In) 的部分代码，感谢！
 
 本项目参考了 [https://github.com/sudojia/AutoTaskScript](https://github.com/sudojia/AutoTaskScript/) 的嘉立创脚本，感谢！

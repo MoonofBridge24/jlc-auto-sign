@@ -399,7 +399,7 @@ def _now_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-# 签到按「东八区自然日」算：不依赖 runner 的时区设置，中国没有夏令时，固定 +8 即可
+# 签到按「UTC + 8 自然日」算：不依赖 runner 的时区设置，中国没有夏令时，固定 +8 即可
 CN_TZ = timezone(timedelta(hours=8))
 
 
@@ -442,8 +442,8 @@ def _cred_updated_at(cred):
 
 def already_signed_today(creds):
     """
-    看这份凭证里是否已有「东八区今天、积分和金豆都完成」的记录。
-    命中返回记录 dict，否则 None。日期是东八区自然日，跨天后自动失效。
+    看这份凭证里是否已有「UTC + 8 今天、积分和金豆都完成」的记录。
+    命中返回记录 dict，否则 None。日期是 UTC + 8 自然日，跨天后自动失效。
     """
     info = (creds or {}).get("last_sign")
     if not isinstance(info, dict):
@@ -610,7 +610,7 @@ def save_credential_cache(usernames=None):
     log("凭证: 已更新 %d 个账号 → %s（%d 字节，工作流会回写到 secret）" % (
         len(accounts), CREDENTIAL_FILE, size))
     if done_today:
-        log("凭证: 其中 %d 个账号已记录今日（东八区）签到完成" % done_today)
+        log("凭证: 其中 %d 个账号已记录今日签到完成" % done_today)
     return CREDENTIAL_FILE
 
 
@@ -1340,7 +1340,7 @@ def _mark_already_done(result, record, account_index):
     result['final_jindou'] = beans.get('balance') or 0
     result['jindou_reward'] = 0
 
-    log("账号 %s - 东八区今天（%s）积分与金豆均已完成，跳过签到" % (
+    log("账号 %s - 今天（%s）积分与金豆均已完成，跳过签到" % (
         account_index, record.get('at') or '时间未知'))
     return result
 
@@ -1375,7 +1375,7 @@ def sign_in_account(username, password, account_index, total_accounts,
     # 1. 先看上次留下的凭证
     creds = get_cached_credentials(username)
 
-    # 0. 东八区今天已经积分+金豆都完成过 → 直接跳过（不发请求、不登录）
+    # 0. 今天已经积分+金豆都完成过 → 直接跳过（不发请求、不登录）
     done_today = already_signed_today(creds)
     if done_today:
         return _mark_already_done(result, done_today, account_index)
@@ -2009,7 +2009,7 @@ def main():
             continue
 
         if result.get('skipped_today'):
-            # 东八区今天已经全部签完，本次不发请求也不推送：只记一行
+            # 今天已经全部签完，本次不发请求也不推送：只记一行
             skipped_accounts.append(index)
             done_at = result.get('last_sign_at') or ''
             clock = done_at.split(' ')[-1][:5] if ' ' in done_at else ''
@@ -2047,7 +2047,7 @@ def main():
         _fmt_reward(total_points_reward), _fmt_reward(total_jindou_reward)))
 
     if skipped_accounts:
-        log("跳过 %d 个账号（东八区今日已完成）：%s" % (
+        log("跳过 %d 个账号（今日已完成）：%s" % (
             len(skipped_accounts),
             "、".join(_masked(i) for i in sorted(skipped_accounts))))
 
