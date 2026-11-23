@@ -146,6 +146,24 @@ class OshwhubClient(_BaseClient):
             raise ApiError("用户信息格式异常")
         return result
 
+    # 积分可能落在这几个字段上，不同接口/版本不一样
+    POINT_KEYS = ("total_point", "points", "totalPoint", "point")
+
+    def read_points(self, *sources):
+        """
+        从若干 (标签, dict) 里找积分，返回 (值, 来源)；都读不到返回 (None, "")。
+
+        优先 getSignInProfile.total_point（官方示例里这个字段稳定存在），
+        再退回 /api/users 的 points。之前只读 users.points，接口没这个字段时就一直是 0。
+        """
+        for label, data in sources:
+            if not isinstance(data, dict):
+                continue
+            for key in self.POINT_KEYS:
+                if data.get(key) is not None:
+                    return _to_number(data.get(key)), "%s.%s" % (label, key)
+        return None, ""
+
     def get_sign_profile(self):
         """签到信息：total_point / isTodaySignIn / goodGiftStatus"""
         result = self._api("GET", "/api/users/getSignInProfile")
@@ -162,6 +180,25 @@ class OshwhubClient(_BaseClient):
         return bool(result)
 
     # ---- 高层流程 ----
+
+    def _points_now(self, default=0):
+        """重新读一次积分：先签到信息，失败或没这个字段再看用户信息"""
+        try:
+            profile = self.get_sign_profile()
+        except AuthExpired:
+            raise
+        except ApiError:
+            profile = None
+
+        value, _ = self.read_points(("getSignInProfile", profile))
+        if value is None:
+            try:
+                value, _ = self.read_points(("users", self.get_user()))
+            except AuthExpired:
+                raise
+            except ApiError:
+                value = None
+        return default if value is None else value
 
     def run(self):
         """
@@ -180,17 +217,24 @@ class OshwhubClient(_BaseClient):
         user = self.get_user()
         nickname = user.get("nickname") or ""
         customer_code = user.get("customerCode") or ""
-        initial = _to_number(user.get("points"))
-
         profile = self.get_sign_profile()
         already = bool(profile.get("isTodaySignIn"))
+
+        # 积分以签到信息里的 total_point 为准，/api/users 的 points 作兜底
+        initial, _ = self.read_points(
+            ("getSignInProfile", profile), ("users", user))
+        if initial is None:
+            initial = 0
+            self.log("积分: 接口里没有积分字段（users=%s；profile=%s）" % (
+                "/".join(sorted(user)[:10]) or "空",
+                "/".join(sorted(profile)[:10]) or "空"))
 
         if not already:
             signed = self.sign_in()
 
             if not signed:
                 # 接口返回 result=false：今天其实已经签过了（并发/前端状态滞后）
-                final = _to_number(self.get_user().get("points"))
+                final = self._points_now(initial)
                 return {
                     "status": "已签到过",
                     "success": True,
@@ -207,7 +251,7 @@ class OshwhubClient(_BaseClient):
             for wait in (0, 1.5, 2.5):
                 if wait:
                     time.sleep(wait)
-                final = _to_number(self.get_user().get("points"))
+                final = self._points_now(initial)
                 if final != initial:
                     break
             return {
@@ -222,7 +266,7 @@ class OshwhubClient(_BaseClient):
             }
 
         # 已签到，只刷新一次积分
-        final = _to_number(self.get_user().get("points"))
+        final = self._points_now(initial)
         return {
             "status": "已签到过",
             "success": True,
@@ -381,8 +425,16 @@ class JlcBeanClient(_BaseClient):
 
 
 def _to_number(value):
+    """把接口里的数字转成 int；兼容 "1,240"、空串、None 这类脏数据"""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
     try:
-        return int(float(value))
+        text = str(value).strip().replace(",", "").replace("，", "")
+        if not text:
+            return 0
+        return int(float(text))
     except (TypeError, ValueError):
         return 0
 
