@@ -1,0 +1,62 @@
+name: 仓库保活（heartbeat）
+
+# 上游仓库已归档，不再拉取上游代码，本仓库也不再有自动合并流程。
+# 这里只做一件事：每 14 天向独立的 heartbeat 分支提交一次时间戳，
+# 避免 GitHub 因仓库长期无活动（60 天）自动禁用本仓库的定时任务。
+# 心跳只落在 heartbeat 分支，main 永远不产生空提交。
+
+on:
+  schedule:
+    - cron: '0 16 */14 * *'  # 每 14 天北京时间 0 点触发一次（UTC+8）
+  workflow_dispatch:  # 支持手动触发
+
+permissions:
+  contents: write  # 推送 heartbeat 分支
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 设置 Git 配置
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git config core.autocrlf false
+
+      - name: 更新心跳
+        run: |
+          set -euo pipefail
+          git fetch origin
+
+          if git show-ref --verify --quiet refs/remotes/origin/heartbeat; then
+            echo "🟢 heartbeat 分支已存在，切过去更新心跳文件"
+            git checkout -B heartbeat origin/heartbeat
+          else
+            echo "🆕 heartbeat 分支不存在，创建独立分支"
+            git checkout --orphan heartbeat
+          fi
+
+          # 分支上只保留 heartbeat.txt 一个文件，其余全部清掉（兼容历史上基于 main 创建的情况）
+          git rm -rf . -q || true
+
+          date -u '+%Y-%m-%d %H:%M:%S UTC' > heartbeat.txt
+          git add heartbeat.txt
+          git commit -q -m "心跳：$(date -u '+%Y-%m-%d')"
+          git push origin heartbeat
+          echo "✅ 心跳文件已更新（分支上仅 heartbeat.txt），main 保持干净"
+
+      - name: Workflow 总结
+        if: always()
+        run: |
+          {
+            echo "### 仓库保活"
+            echo
+            echo "- 心跳分支：\`heartbeat\`"
+            echo "- 最近心跳：$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          } >> "$GITHUB_STEP_SUMMARY"

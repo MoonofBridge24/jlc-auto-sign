@@ -251,39 +251,27 @@ Server酱3 推送在退出前完成，所以消息照常能收到。
 
 实际运行时间会比设置时间延迟一小时以内，具体取决于当时 GitHub 资源占用情况。
 
-保活用的心跳记录会统一推到独立的 `heartbeat` 分支（首次运行自动创建），分支上只有一个 `heartbeat.txt`，内容是最近一次运行时间；main 分支不再产生空提交。
+保活由 `heartbeat.yml` 负责：每 14 天向独立的 `heartbeat` 分支提交一次时间戳（首次运行自动创建），分支上只有一个 `heartbeat.txt`；main 不产生空提交。
 
 ![步骤5](img/5.png)
 
 ---
 
-### 5. 获取更新
+### 5. 关于上游更新与仓库保活
 
-手动方式：在你 fork 的仓库里点 **Sync fork** 即可。
+上游仓库 `zhangMonday/PCBfactory-auto-check-in` 已经**归档（只读）**，不会再产生新提交，
+所以本仓库不再检查上游更新，原来的 `sync-upstream.yml` 和 `merge-upstream.yml` 已经移除。
 
-自动化方式（本仓库默认开启）：`sync-upstream.yml` 每 14 天检查一次上游，
-**不会直接改 main**，而是：
+需要更新代码时，在你 fork 的仓库里点 **Sync fork** 手动同步即可。
 
-1. 有更新时把上游提交应用到独立分支 `upstream-sync`（跳过上游的空提交和 `.github/workflows` 改动，
-   冲突的提交会跳过并在 PR 里列出）；
-2. 对 `main` 开一个带 `upstream-sync` 标签的 **Pull Request** 通知仓库管理者，里面列出提交、变更文件、跳过项；
-   已有未关闭的同步 PR 时只更新正文并追加评论，不重复开；
-3. 你确认后，在 PR 页面点 **Merge pull request** 即可合并到 main；
-   或者到 **Actions → 合并上游同步分支到 main → Run workflow**，
-   工作流会合并 `upstream-sync` 到 main、清理对应 PR，然后删除该分支。
+仍然保留一个 `heartbeat.yml`，每 14 天往独立的 `heartbeat` 分支提交一次时间戳：
 
-手动合并工作流有三个选项：分支名（默认 `upstream-sync`）、是否删除分支、是否清理同步 PR。
-如果 main 在此期间被改过、产生冲突，合并会中止并报错，需要本地解决后再推。
+- GitHub 会在仓库连续 60 天无活动后自动禁用 scheduled workflow，心跳可以避免签到任务被悄悄停掉；
+- 心跳只写在 `heartbeat` 分支，分支上只有一个 `heartbeat.txt`，`main` 不产生空提交；
+- 保活失败时这一步会标红，方便你及时发现自己仓库的定时任务状态。
 
-> 首次使用 PR 通知时，如果日志报 `GitHub Actions is not permitted to create or approve pull requests`，
-> 到 **Settings → Actions → General → Workflow permissions** 勾选
-> **Allow GitHub Actions to create and approve pull requests** 再重跑即可
-> （分支此时已经推送成功，也可以直接手动开 PR）。
+下一次自动签到会自动运行当前 `main` 上的程序。
 
-> 上游的 `.github/workflows` 改动不会被同步——本仓库的 workflow 是定制的，
-> 而且 `GITHUB_TOKEN` 也无权推送 workflow 文件。上游的 workflow 变更需要你手动参考。
-
-下一次自动签到会自动运行更新后的程序，推荐定期检查更新来优化脚本并获取最新功能。
 
 ---
 
