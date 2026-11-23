@@ -34,12 +34,6 @@ jobs:
       - name: Prepare chromedriver
         uses: nanasess/setup-chromedriver@v2
 
-      - name: 'Masking self-check'
-        # 这行不含任何 secret。如果它在网页日志里变成 ***，说明是 GitHub 在按 secret
-        # 遮罩日志里的数字片段（通常是某个值很短的 secret 误伤），跟脚本无关
-        run: |
-          echo "mask-probe: 3.7.17 22:16:57 1/4 188****045"
-
       - name: 'Working'
         env:
           # 账号密码走环境变量而不是命令行参数：secret 出现在命令行会被日志整段打码成 ***，

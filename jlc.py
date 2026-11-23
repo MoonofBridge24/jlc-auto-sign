@@ -223,14 +223,49 @@ def inpage_fetch(driver, url, headers=None, timeout=15):
                 "body": "页面内请求失败: %s" % str(e).splitlines()[0][:120]}
 
 
-def wait_oshwhub_login(driver, account_index, timeout=15.0):
+def _user_is_authenticated(user):
+    """
+    判断 /api/users 的 result 是不是真实登录用户。
+
+    坑：匿名会话也返回 HTTP 200（result 里是一份访客信息），只看状态码会把
+    「还没换好 session」当成登录成功，接着取到的 Cookie 缺 isLoginCustomerFlag，
+    积分接口必然 401。这里必须看 payload：有 customerCode 才算登录，
+    兜底接受 uuid + accountCode 同时存在的返回。
+    """
+    if not isinstance(user, dict):
+        return False
+    if str(user.get("customerCode") or "").strip():
+        return True
+    return bool(str(user.get("uuid") or "").strip()) and \
+        bool(str(user.get("accountCode") or "").strip())
+
+
+def _payload_of(res):
+    """/api/users 页面内请求结果 → (is_authenticated, 简述)"""
+    body = (res or {}).get("body")
+    try:
+        data = json.loads(body) if isinstance(body, str) else (body or {})
+    except Exception:
+        return False, "返回不是 JSON"
+    if not isinstance(data, dict):
+        return False, "返回格式异常"
+    if data.get("success") is False:
+        return False, str(data.get("msg") or "success=false")[:60]
+    return _user_is_authenticated(data.get("result")), ""
+
+
+def wait_oshwhub_login(driver, account_index, timeout=20.0):
     """
     等开源平台登录态真正生效。
 
     SSO 回跳到 oshwhub.com 时 Cookie 还没换好（前端拿到 ticket 后再调一次接口才写
     session Cookie），只看 URL 就取凭证会拿到匿名会话，接着调 /api/users 就是 401。
-    这里在页面里轮询 /api/users，200 才算登录完成。
+    这里在页面里轮询 /api/users，**且返回里要有 customerCode** 才算登录完成
+    （匿名会话同样是 HTTP 200，只看状态码会误判）。
+
+    中途还没生效就重开一次签到页：passport 的会话已经在了，重开可以静默走完 SSO 握手。
     """
+    started = time.time()
     try:
         if "oshwhub.com" not in (driver.current_url or ""):
             # 不在开源平台页面时，页面内 fetch 是跨域请求（会被 CORS 挡掉），先回站内
@@ -243,17 +278,38 @@ def wait_oshwhub_login(driver, account_index, timeout=15.0):
         log("账号 %s - 回到开源平台页面失败: %s" % (
             account_index, str(e).splitlines()[0][:120]))
 
-    deadline = time.time() + timeout
+    deadline = started + timeout
     attempt = 0
+    reloaded = False
+    last_note = ""
     while time.time() < deadline:
         attempt += 1
         res = inpage_fetch(driver, "https://oshwhub.com/api/users", timeout=10)
         status = res.get("status")
         if status == 200:
-            log("账号 %s - 页面内校验登录态通过（第 %d 次）" % (account_index, attempt))
-            return True
-        log("账号 %s - 页面内校验登录态: HTTP %s（第 %d 次），继续等" % (
-            account_index, status or "无响应", attempt))
+            authed, note = _payload_of(res)
+            if authed:
+                log("账号 %s - 页面内校验登录态通过（第 %d 次）" % (account_index, attempt))
+                return True
+            last_note = note or "返回的是匿名用户"
+        else:
+            last_note = "HTTP %s" % (status or "无响应")
+
+        # 已经等了 8 秒还没换好，重开一次签到页触发 SSO 静默登录
+        if not reloaded and time.time() - started > 8:
+            reloaded = True
+            log("账号 %s - 登录态仍未生效（%s），重开签到页再走一次 SSO" % (
+                account_index, last_note))
+            try:
+                driver.get("https://oshwhub.com/sign_in")
+                WebDriverWait(driver, 15).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "body")))
+            except Exception:
+                pass
+            continue
+
+        log("账号 %s - 页面内校验登录态: %s（第 %d 次），继续等" % (
+            account_index, last_note, attempt))
         time.sleep(1.2)
     return False
 
@@ -868,6 +924,38 @@ def extract_credentials_from_browser(driver, account_index):
     }
 
 
+def _verify_oshwhub_session(creds, account_index):
+    """
+    用提取到的 Cookie 真调一次 /api/users，确认会话确实有效。
+
+    比只看 isLoginCustomerFlag 可靠：那个 Cookie 偶尔不写（会话其实是好的），
+    而匿名会话也可能带着一堆旧 Cookie。接口能返回 customerCode 才算数。
+    """
+    try:
+        client = OshwhubClient(
+            creds.get('cookies') or {}, index=account_index,
+            logger=lambda m: None,
+            cookie_header=creds.get('cookie_header') or '',
+            ua=creds.get('ua') or '')
+        user = client.get_user() or {}
+    except (AuthExpired, ApiError) as e:
+        log("账号 %s - 会话校验失败: %s" % (
+            account_index, str(e).splitlines()[0][:100]))
+        return False
+    except Exception as e:
+        log("账号 %s - 会话校验异常: %s" % (
+            account_index, str(e).splitlines()[0][:100]))
+        return False
+
+    if _user_is_authenticated(user):
+        log("账号 %s - 会话校验通过（customerCode=%s）" % (
+            account_index, mask_account(user.get('customerCode'))))
+        return True
+    log("账号 %s - 会话校验失败：接口返回匿名用户（缺 customerCode，Cookie 里%s isLoginCustomerFlag）" % (
+        account_index, "有" if creds.get('cookies', {}).get('isLoginCustomerFlag') else "没有"))
+    return False
+
+
 PASSPORT_LOGIN_FALLBACK = (
     "https://passport.jlc.com/login?appId=JLC_OSHWHUB"
     "&redirectUrl=https%3A%2F%2Foshwhub.com%2Fsign_in"
@@ -1212,11 +1300,27 @@ def login_for_credentials(username, password, account_index):
         creds = extract_credentials_from_browser(driver, account_index)
         if not creds.get('cookies') and not creds.get('access_token'):
             return fail('凭证提取失败')
-        # 开源平台会话没建立时，后面的积分签到必然 401，这里直接判失败更好排查
-        if not creds.get('cookies', {}).get('isLoginCustomerFlag'):
-            log("账号 %s - 开源平台会话未建立（Cookie 缺少 isLoginCustomerFlag）" % account_index)
-            return fail('登录未生效')
-        return creds, None
+
+        # 7. 用取到的 Cookie 真调一次接口：开源平台会话没建立时，后面的积分签到必然 401
+        if _verify_oshwhub_session(creds, account_index):
+            return creds, None
+
+        # 8. 会话没建立：passport 的登录态已经在了，重开签到页能静默走完 SSO，
+        #    比直接判失败划算（实测换号密集时 4 个号有 2 个卡在这一步）
+        log("账号 %s - 重新打开签到页再走一次 SSO" % account_index)
+        try:
+            driver.get("https://oshwhub.com/sign_in")
+            WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body")))
+        except Exception:
+            pass
+
+        if wait_oshwhub_login(driver, account_index, timeout=20.0):
+            creds = extract_credentials_from_browser(driver, account_index)
+            if _verify_oshwhub_session(creds, account_index):
+                return creds, None
+        log("账号 %s - 二次 SSO 后仍未建立开源平台会话" % account_index)
+        return fail('登录未生效')
 
     except Exception as e:
         log("账号 %s - 登录流程异常: %s" % (account_index, str(e).splitlines()[0][:200]))
