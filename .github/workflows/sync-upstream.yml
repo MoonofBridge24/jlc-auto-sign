@@ -1,16 +1,24 @@
-name: 自动更新并保持签到脚本活跃
+name: 上游同步（只建分支 + 通知，不直接合并）
 
-# 这个脚本用于保持仓库活跃，防止 actions 因为仓库不活跃而自动禁用。
-# 心跳统一放在独立的 heartbeat 分支：分支上只有 heartbeat.txt 一个文件（内容是日期），
-# 首次运行自动创建；main 上不再产生空提交，也不会累积文件。
+# 这个脚本做三件事：
+#   1. 检查上游仓库（UPSTREAM_REPO）是否有新提交；
+#   2. 有更新时把提交 cherry-pick 到独立分支 upstream-sync 并推送，**不碰 main**；
+#   3. 开一个 issue 通知仓库管理者，等人工确认后再跑「合并上游同步分支到 main」工作流。
+# 另外仍然保留 heartbeat 保活（防止 actions 因仓库不活跃被自动禁用），心跳只在 heartbeat 分支。
 
 on:
   schedule:
-    - cron: '0 16 */7 * *'  # 每7天北京时间 0 点触发一次（UTC+8）
+    - cron: '0 16 */14 * *'  # 每14天北京时间 0 点触发一次（UTC+8）
   workflow_dispatch:  # 支持手动触发
 
 permissions:
-  contents: write  # 允许写入仓库内容
+  contents: write  # 推送同步分支 / heartbeat 分支
+  issues: write    # 创建和更新同步通知 issue
+
+env:
+  UPSTREAM_REPO: zhangMonday/PCBfactory-auto-check-in
+  SYNC_BRANCH: upstream-sync
+  ISSUE_LABEL: upstream-sync
 
 jobs:
   sync-upstream:
@@ -20,7 +28,7 @@ jobs:
       - name: 检出仓库代码
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # 获取完整历史，便于 rebase/cherry-pick
+          fetch-depth: 0  # 获取完整历史，便于 cherry-pick
 
       - name: 设置 Git 配置
         run: |
@@ -30,9 +38,8 @@ jobs:
 
       - name: 添加上游仓库
         run: |
-          if ! git remote | grep -q upstream; then
-            git remote add upstream https://github.com/zhangMonday/PCBfactory-auto-check-in.git
-          
+          if ! git remote | grep -q '^upstream$'; then
+            git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
           fi
 
       - name: 切换到 main 分支
@@ -44,98 +51,167 @@ jobs:
       - name: 检查是否有更新
         id: check-update
         run: |
-          if git show-ref --verify --quiet refs/remotes/upstream/main; then
-            UPDATE_COUNT=$(git rev-list --count main..upstream/main 2>/dev/null || echo "0")
-            if [ "$UPDATE_COUNT" -gt 0 ]; then
-              if git diff --quiet main..upstream/main 2>/dev/null; then
-                echo "has_update=false" >> $GITHUB_OUTPUT
-                echo "changes=none" >> $GITHUB_OUTPUT
-              else
-                echo "has_update=true" >> $GITHUB_OUTPUT
-                CHANGES=$(git diff --name-only main..upstream/main 2>/dev/null | tr '\n' ',' | sed 's/,$//' || echo "none")
-                echo "changes=$CHANGES" >> $GITHUB_OUTPUT
-              fi
-            else
-              echo "has_update=false" >> $GITHUB_OUTPUT
-              echo "changes=none" >> $GITHUB_OUTPUT
-            fi
-          else
-            echo "has_update=false" >> $GITHUB_OUTPUT
-            echo "changes=none" >> $GITHUB_OUTPUT
-            echo "⚠️ 警告：上游 main 分支不存在"
-          fi
-
-      - name: 检查上游更新是否包含 workflow 文件
-        if: steps.check-update.outputs.has_update == 'true'
-        id: check-workflow-update
-        run: |
-          CHANGES="${{ steps.check-update.outputs.changes }}"
-          if echo "$CHANGES" | grep -q '\.github/workflows/'; then
-            echo "has_workflow_update=true" >> $GITHUB_OUTPUT
-          else
-            echo "has_workflow_update=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: 拉取上游代码并同步（如果有更新）
-        if: steps.check-update.outputs.has_update == 'true' && steps.check-workflow-update.outputs.has_workflow_update == 'false'
-        run: |
-          echo "正在执行：拉取上游代码并同步"
-          set -e
-
-          ALL_COMMITS=($(git rev-list --reverse main..upstream/main 2>/dev/null))
-          if [ ${#ALL_COMMITS[@]} -eq 0 ]; then
-            echo "没有找到需要同步的提交"
+          if ! git show-ref --verify --quiet refs/remotes/upstream/main; then
+            echo "has_update=false" >> "$GITHUB_OUTPUT"
+            echo "commit_count=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::上游 main 分支不存在，跳过同步"
             exit 0
           fi
 
-          echo "所有上游更新: ${ALL_COMMITS[*]}"
+          COUNT=$(git rev-list --count main..upstream/main 2>/dev/null || echo 0)
+          echo "commit_count=$COUNT" >> "$GITHUB_OUTPUT"
 
-          NON_EMPTY_COMMITS=()
-          IGNORED_COMMITS=()
-          for commit in "${ALL_COMMITS[@]}"; do
-            msg=$(git log -1 --format=%s $commit)
-            if echo "$msg" | grep -q "保持仓库活跃\|空修改，用于保持仓库活跃"; then
-              IGNORED_COMMITS+=("$commit")
+          if [ "$COUNT" -gt 0 ] && ! git diff --quiet main..upstream/main 2>/dev/null; then
+            echo "has_update=true" >> "$GITHUB_OUTPUT"
+            echo "检测到上游 $COUNT 个新提交"
+          else
+            echo "has_update=false" >> "$GITHUB_OUTPUT"
+            echo "上游没有新的有效变更"
+          fi
+
+      - name: 在独立分支上合并上游更新
+        id: prepare
+        if: steps.check-update.outputs.has_update == 'true'
+        run: |
+          set -euo pipefail
+          export GITHUB_OUTPUT="${GITHUB_OUTPUT:-/dev/null}"
+          export GITHUB_ENV="${GITHUB_ENV:-/dev/null}"
+
+          REPORT="${RUNNER_TEMP:-/tmp}/sync-report.md"
+          rm -f "$REPORT"
+
+          git checkout -B "$SYNC_BRANCH" main
+
+          applied=0; ignored=0; conflicted=0
+          applied_text=""; conflicted_text=""
+          PATCH=$(mktemp)
+
+          for commit in $(git rev-list --reverse main..upstream/main); do
+            msg=$(git log -1 --format=%s "$commit")
+            case "$msg" in
+              *保持仓库活跃*|*空修改，用于保持仓库活跃*)
+                ignored=$((ignored + 1))
+                continue
+                ;;
+            esac
+
+            # 只取「除 .github/workflows 之外」的改动：GITHUB_TOKEN 无权推送 workflow 变更，
+            # 而且本仓库的 workflow 是定制的，不应该被上游覆盖。
+            # 用 apply 而不是 cherry-pick，是因为上游经常「代码 + workflow」混在一个提交里，
+            # cherry-pick 会因 workflow 冲突把整条提交（包括代码）一起丢掉。
+            base=$(git rev-parse -q --verify "${commit}^" || true)
+            if [ -n "$base" ]; then
+              git diff "$base" "$commit" -- . ':(exclude).github/workflows' > "$PATCH" || true
             else
-              NON_EMPTY_COMMITS+=("$commit")
+              git show --format= --no-color "$commit" -- . ':(exclude).github/workflows' > "$PATCH" || true
+            fi
+
+            if [ ! -s "$PATCH" ]; then
+              ignored=$((ignored + 1))
+              continue
+            fi
+
+            if git apply --index --3way "$PATCH" 2>/dev/null; then
+              if git diff --quiet --cached; then
+                git reset -q --hard
+                ignored=$((ignored + 1))
+              else
+                git commit -q -m "$msg [${commit:0:7}]"
+                applied=$((applied + 1))
+                applied_text="${applied_text}${commit:0:7} ${msg}"$'\n'
+              fi
+            else
+              git reset -q --hard
+              conflicted=$((conflicted + 1))
+              conflicted_text="${conflicted_text}${commit:0:7} ${msg}"$'\n'
+              echo "::warning::${commit:0:7} 与本地改动冲突，已跳过"
             fi
           done
+          rm -f "$PATCH"
 
-          echo "要应用的更新: ${NON_EMPTY_COMMITS[*]}"
-          echo "忽略的空更新: ${IGNORED_COMMITS[*]}"
-
-          OLD_TREE=$(git rev-parse HEAD)
-
-          if [ ${#NON_EMPTY_COMMITS[@]} -gt 0 ]; then
-            for commit in "${NON_EMPTY_COMMITS[@]}"; do
-              if git cherry-pick --no-commit $commit; then
-                if git diff --quiet --cached; then
-                  git reset --hard
-                  echo "跳过冗余/空更新 $commit"
-                else
-                  git commit -m "$(git log -1 --format=%s $commit) [$commit]"
-                  echo "✅ 已应用更新 $commit"
-                fi
-              else
-                echo "⚠️ 挑选 $commit 失败（可能冲突），正在中止"
-                git cherry-pick --abort || true
-              fi
-            done
+          # 兜底：万一还有 workflow 差异（例如上游新增文件），一律以 main 为准
+          if ! git diff --quiet main -- .github/workflows; then
+            git checkout main -- .github/workflows 2>/dev/null || true
+            git diff --name-only --diff-filter=A main -- .github/workflows \
+              | while read -r path; do [ -n "$path" ] && git rm -q -f "$path" || true; done
+            git add -A .github/workflows
+            git commit -q -m "chore: 不同步上游 workflow 变更（需人工确认）" || true
           fi
 
-          # 没有实际变化就不提交，main 上不留空提交（保活交给 heartbeat 分支）
-          if [ "$OLD_TREE" = "$(git rev-parse HEAD)" ]; then
-            echo "🟡 没有实际变更，main 不做任何提交"
+          if git diff --quiet main..HEAD; then
+            echo "🟡 上游提交没有产生实际变更（可能全是空提交），不建分支也不通知"
+            git checkout -q main
+            git branch -D "$SYNC_BRANCH" >/dev/null 2>&1 || true
+            echo "has_branch=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-          git push origin main || echo "⚠️ push 失败，请检查权限设置"
-          echo "✅ 已成功同步（应用了 ${#NON_EMPTY_COMMITS[@]} 个更新）"
+          AHEAD=$(git rev-list --count main..HEAD)
+          git push -f origin "$SYNC_BRANCH"
+          echo "✅ 已推送分支 $SYNC_BRANCH（$AHEAD 个提交，未合并到 main）"
 
-      - name: 提示手动更新（如果上游更新包含 workflow 文件）
-        if: steps.check-update.outputs.has_update == 'true' && steps.check-workflow-update.outputs.has_workflow_update == 'true'
+          echo "has_branch=true" >> "$GITHUB_OUTPUT"
+          echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
+
+          # 通知正文写到 RUNNER_TEMP，避免被后面的 heartbeat 步骤清理掉
+          {
+            echo "上游仓库 \`${UPSTREAM_REPO}\` 有新提交，已同步到分支 \`${SYNC_BRANCH}\`，**尚未合并到 main**。"
+            echo
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 待合并提交 | ${AHEAD} 个 |"
+            echo "| 已应用 | ${applied} 个 |"
+            echo "| 跳过（空提交/无代码变更） | ${ignored} 个 |"
+            echo "| 跳过（与本地冲突） | ${conflicted} 个 |"
+            echo "| workflow 文件 | 不同步（保留本仓库版本） |"
+            echo
+            echo "### 已应用到分支的提交"
+            echo
+            echo '```'
+            printf '%s' "$applied_text" | sed '/^$/d'
+            echo '```'
+            echo
+            if [ "$conflicted" -gt 0 ]; then
+              echo "### 冲突跳过的提交（需人工 cherry-pick）"
+              echo
+              echo '```'
+              printf '%s' "$conflicted_text" | sed '/^$/d'
+              echo '```'
+              echo
+            fi
+            echo "### 变更文件"
+            echo
+            echo '```'
+            git diff --name-status main..HEAD | head -50
+            echo '```'
+            echo
+            echo "确认无误后，运行 **Actions → 合并上游同步分支到 main → Run workflow** 完成合并。"
+            echo "合并成功后本 issue 会自动关闭，\`${SYNC_BRANCH}\` 分支也会被删除。"
+          } > "$REPORT"
+          echo "REPORT=$REPORT" >> "$GITHUB_ENV"
+
+      - name: 通知仓库管理者
+        if: steps.prepare.outputs.has_branch == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "⚠️ 上游更新包含 workflow 脚本内容，无法自动更新，请手动同步。"
-          echo "（main 不做空提交，保活交给 heartbeat 分支）"
+          set -euo pipefail
+          TITLE="上游同步待合并（${SYNC_BRANCH}，$(date -u '+%Y-%m-%d')）"
+
+          gh label create "$ISSUE_LABEL" --color FBCA04 \
+            --description "上游同步分支待合并" --force >/dev/null 2>&1 || true
+
+          EXISTING=$(gh issue list --label "$ISSUE_LABEL" --state open --limit 1 \
+            --json number --jq '.[0].number // empty')
+
+          if [ -n "${EXISTING:-}" ]; then
+            echo "已有待合并通知 #$EXISTING，追加一条评论"
+            gh issue comment "$EXISTING" --body-file "$REPORT"
+            echo "::notice title=上游同步::分支 $SYNC_BRANCH 已更新，已追加到 #$EXISTING"
+          else
+            URL=$(gh issue create --title "$TITLE" --body-file "$REPORT" --label "$ISSUE_LABEL")
+            echo "::notice title=上游同步::已创建通知 $URL，等待人工确认后合并"
+          fi
 
       - name: 心跳提交（heartbeat 分支）
         run: |
@@ -159,11 +235,10 @@ jobs:
 
       - name: Workflow 总结
         run: |
-          echo "-----------------------------------------"
-          echo "最终结果：has_update = ${{ steps.check-update.outputs.has_update || '未设置' }}"
-          if [ "${{ steps.check-update.outputs.has_update }}" = "true" ]; then
-            echo "最终结果：has_workflow_update = ${{ steps.check-workflow-update.outputs.has_workflow_update || '未设置' }}"
-          else
-            echo "最终结果：has_workflow_update = 未检查（无更新）"
-          fi
-          echo "-----------------------------------------"
+          {
+            echo "### 上游同步结果"
+            echo
+            echo "- 上游新提交：${{ steps.check-update.outputs.commit_count || 0 }} 个"
+            echo "- 是否建了同步分支：${{ steps.prepare.outputs.has_branch || 'false' }}"
+            echo "- 同步分支：\`${SYNC_BRANCH}\`（main 未被修改）"
+          } >> "$GITHUB_STEP_SUMMARY"
