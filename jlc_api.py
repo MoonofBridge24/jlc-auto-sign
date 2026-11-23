@@ -133,11 +133,14 @@ class OshwhubClient(_BaseClient):
             for name, value in self.cookies.items():
                 self.session.cookies.set(name, value, domain="oshwhub.com")
 
-    def _api(self, method, path):
+    def _api(self, method, path, **kwargs):
         url = self.BASE + path
-        payload = self._send(method, url)
+        payload = self._send(method, url, **kwargs)
         if not payload.get("success"):
             msg = payload.get("msg") or payload.get("message") or "success=false"
+            code = payload.get("code")
+            if code:
+                msg = "%s（code=%s）" % (msg, code)
             raise ApiError(str(msg))
         return payload.get("result")
 
@@ -175,10 +178,15 @@ class OshwhubClient(_BaseClient):
 
     def sign_in(self):
         """
-        提交签到。返回 True=本次签到成功，False=今天已经签到过。
-        接口约定：success=true 且 result=true/false。
+        提交签到。返回接口的 result：True=签到成功，False=服务端拒绝（可能已签到，也可能被拒）。
+
+        前端实际发的是 axios POST，body 是 {"_t": 毫秒时间戳}、Content-Type 为 JSON
+        （见 sign_in 页 chunk：`v_("/api/users/signIn", {_t: Date.now()})`）。
+        这里照抄同样的格式，免得服务端因为 body 结构不同走到别的分支。
         """
-        result = self._api("POST", "/api/users/signIn")
+        payload = {"_t": int(time.time() * 1000)}
+        result = self._api("POST", "/api/users/signIn", json=payload,
+                           headers={"Content-Type": "application/json;charset=UTF-8"})
         return bool(result)
 
     # ---- 签到好礼（七日好礼 / 月度好礼）----
@@ -298,17 +306,49 @@ class OshwhubClient(_BaseClient):
                 value = None
         return default if value is None else value
 
-    def _sign_block_reasons(self, profile, user):
+    def _profile_quiet(self):
+        """读签到信息；失败返回 None（用于「签到之后确认到底签上没有」）"""
+        try:
+            return self.get_sign_profile()
+        except AuthExpired:
+            raise
+        except ApiError:
+            return None
+
+    def _submit_sign_in(self):
         """
-        签到接口返回 false 时的可能原因，给用户可操作的方向。
-        开源平台要求账号先设置昵称（系统自动生成的 eda_xxx 不算）。
+        提交签到，返回 (结果, 最新 profile, 错误说明)：
+
+        - 结果 = 'ok'      本次真的签上了（积分 +1）
+        - 结果 = 'already' 接口回 false，但复核发现今天已经签过（并发/状态滞后）
+        - 结果 = 'failed'  两次都没签上
+
+        result=false 时不直接判失败：先复核 isTodaySignIn，仍为未签到才间隔 4 秒重试一次
+        （网页上多点一次也能成功，说明偶发拒绝可以靠重试过掉）。
         """
-        reasons = []
-        if str((user or {}).get("nickname") or "").startswith("eda_"):
-            reasons.append("未设置昵称")
-        if _to_number((profile or {}).get("userProjectCount")) == 0:
-            reasons.append("还没有开源项目")
-        return reasons or ["账号状态不满足签到条件"]
+        def once():
+            try:
+                return bool(self.sign_in()), ''
+            except AuthExpired:
+                raise
+            except ApiError as e:
+                return False, str(e)
+
+        ok, err = once()
+        if ok:
+            return 'ok', None, ''
+
+        check = self._profile_quiet()
+        if check is not None and check.get("isTodaySignIn"):
+            return 'already', check, ''
+
+        self.log("积分: 签到返回 false 且仍未签到%s，4 秒后重试一次" % (
+            "（%s）" % err if err else ""))
+        time.sleep(4)
+        ok, err = once()
+        if ok:
+            return 'ok', None, ''
+        return 'failed', self._profile_quiet(), err
 
     def run(self):
         """
@@ -343,45 +383,38 @@ class OshwhubClient(_BaseClient):
         status = "已签到过"
         message = "今天已签到过"
         if not already:
-            if self.sign_in():
+            outcome, check, err = self._submit_sign_in()
+            if outcome == 'ok':
                 status = "签到成功"
                 message = "签到成功"
+            elif outcome == 'already':
+                # 并发/状态滞后：接口回 false，但服务端已经记上了
+                status = "已签到过"
+                message = "今天已签到过（签到接口返回 false，复核已签到）"
             else:
-                # result=false 有两种可能：并发下今天其实已经签过，或签到被服务端拒绝。
-                # 必须复核 profile——仍显示未签到就是真失败，绝不能当成「已签到过」
-                # （之前就是这样把失败报成已签到，用户看到的是「已签到过，积分 0 → 0」）。
-                try:
-                    check = self.get_sign_profile()
-                except (ApiError, AuthExpired):
-                    check = None
+                view = check or profile
+                status = "签到未生效"
+                message = ("签到接口报错：%s" % err) if err else "签到接口连续返回 false，服务端未记录签到"
+                self.log(
+                    "积分: 签到未生效 —— result=false；isTodaySignIn=%s，周签到=%s，"
+                    "月签到=%s，项目数=%s，昵称=%s" % (
+                        view.get("isTodaySignIn"), view.get("week_signIn_days"),
+                        view.get("month_signIn_days"), view.get("userProjectCount"),
+                        nickname or "空"))
+                return {
+                    "status": status,
+                    "success": False,
+                    # 已经重试过一次，再重试只会继续撞限流
+                    "non_retryable": True,
+                    "initial_points": initial,
+                    "final_points": initial,
+                    "points_reward": 0,
+                    "nickname": nickname,
+                    "customer_code": customer_code,
+                    "gifts": [],
+                    "message": message,
+                }
 
-                if check is not None and check.get("isTodaySignIn"):
-                    status = "已签到过"
-                    message = "今天已签到过（签到接口返回 false，复核已签到）"
-                else:
-                    view = check or profile
-                    reasons = self._sign_block_reasons(view, user)
-                    status = "签到未生效"
-                    message = "签到接口返回 false，疑似%s" % "、".join(reasons)
-                    self.log(
-                        "积分: 签到未生效 —— result=false；isTodaySignIn=%s，周签到=%s，月签到=%s，"
-                        "项目数=%s，昵称系统自动生成=%s" % (
-                            view.get("isTodaySignIn"), view.get("week_signIn_days"),
-                            view.get("month_signIn_days"), view.get("userProjectCount"),
-                            "是" if str(nickname).startswith("eda_") else "否"))
-                    return {
-                        "status": status,
-                        "success": False,
-                        # 账号条件不满足，重试和重登都没意义，只会再撞一次限流
-                        "non_retryable": True,
-                        "initial_points": initial,
-                        "final_points": initial,
-                        "points_reward": 0,
-                        "nickname": nickname,
-                        "customer_code": customer_code,
-                        "gifts": [],
-                        "message": message,
-                    }
         # sign_in() 返回 false 但复核发现已签到：按已签到处理
 
         # 好礼：签到后再读一次签到信息，拿最新的连续签到天数和领取状态

@@ -1016,6 +1016,38 @@ def check_password_error(driver, account_index, timeout=2.5):
             return False
         time.sleep(0.25)
 
+def _click_enter_system(driver):
+    """
+    CAS「您当前已处于登录状态」页需要一个「进入系统」的点击才会回跳。
+    点到返回 True（有些账号登录后会停在这一页，旧代码在这里直接判「跳转失败」）。
+    """
+    try:
+        els = driver.find_elements(By.XPATH, '//*[normalize-space(text())="进入系统"]')
+    except Exception:
+        return False
+    for el in els:
+        try:
+            if not el.is_displayed():
+                continue
+            driver.execute_script("arguments[0].click();", el)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _need_profile_completion(driver):
+    """是不是被「完善资料」页挡住了：新账号首次登录必须选账号类型才能继续"""
+    try:
+        if "update_user_info" in (driver.current_url or ""):
+            return True
+        text = driver.execute_script(
+            "var b = document.body; return b ? b.innerText.slice(0, 800) : '';") or ''
+    except Exception:
+        return False
+    return "完善资料" in text and "下一步" in text
+
+
 def _empty_account_result(account_index, retry_count=0, is_final_retry=False):
     return {
         'account_index': account_index,
@@ -1153,15 +1185,26 @@ def login_for_credentials(username, password, account_index):
         # 5. 等待跳转回签到页
         log("账号 %s - 等待登录跳转..." % account_index)
         jumped = False
-        for _ in range(15):
+        entered = 0
+        for _ in range(22):
             current_url = driver.current_url
             if "oshwhub.com" in current_url and "passport.jlc.com" not in current_url:
                 log("账号 %s - 成功跳转回签到页面" % account_index)
                 jumped = True
                 break
+            # CAS 有时停在「已登录账号」页，需要点一下「进入系统」才继续回跳
+            if entered < 2 and _click_enter_system(driver):
+                entered += 1
+                log("账号 %s - CAS 停在「已登录账号」页，已点「进入系统」" % account_index)
+                time.sleep(3)
+                continue
             time.sleep(1)
 
         if not jumped:
+            if _need_profile_completion(driver):
+                log("账号 %s - 被「完善资料」页拦住：该账号首次登录需先在网页端补全资料"
+                    "（选企业/学校/个人后点「下一步」）" % account_index)
+                return fail('需先完善资料')
             log("账号 %s - 跳转超时，当前页面标题: %s" % (account_index, driver.title))
             return fail('跳转失败')
 
@@ -1169,6 +1212,10 @@ def login_for_credentials(username, password, account_index):
         creds = extract_credentials_from_browser(driver, account_index)
         if not creds.get('cookies') and not creds.get('access_token'):
             return fail('凭证提取失败')
+        # 开源平台会话没建立时，后面的积分签到必然 401，这里直接判失败更好排查
+        if not creds.get('cookies', {}).get('isLoginCustomerFlag'):
+            log("账号 %s - 开源平台会话未建立（Cookie 缺少 isLoginCustomerFlag）" % account_index)
+            return fail('登录未生效')
         return creds, None
 
     except Exception as e:
