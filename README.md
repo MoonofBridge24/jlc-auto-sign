@@ -142,55 +142,52 @@ python test_captcha.py --fake            # 用假账号触发验证码，只看�
 
 ### 2.1 配置凭证持久化（强烈推荐）
 
-登录成功后脚本会提取 Cookie 和 `X-JLC-AccessToken`，写到 `credentials.json`。
-下一次运行优先用这份缓存，凭证有效就完全不启动浏览器。缓存靠两条通道传递，任意一条可用即可：
+登录成功后脚本提取 Cookie 和 `X-JLC-AccessToken`，写到 `credentials.json`；
+工作流最后一步用 `gh secret set` 把它写回 **`JLC_CREDENTIALS`**。
+下一次运行由环境变量注入，凭证有效就完全不启动浏览器。
 
-| 通道 | 怎么工作 | 需要什么 |
-| --- | --- | --- |
-| **Secret**（主） | 最后一步用 `gh secret set` 写入 `JLC_CREDENTIALS`，下次运行由 `env` 注入 | `JLC_SECRET_PAT` |
-| **Actions 缓存**（备） | `actions/cache` 保存/还原 `credentials.json` | 无需额外配置，缓存可能被 GitHub 淘汰 |
-
-脚本会把两边的凭证都读出来，按 `updated_at` **每个账号各取较新的一份**，
-所以 secret 落后时不会覆盖掉缓存里的新凭证；发现 secret 落后还会顺手回写一次（自愈）。
+凭证只保存在这一个 secret 里，不进 git（`credentials.json` 已写进 `.gitignore`）。
 
 #### 创建 `JLC_SECRET_PAT`
 
+`gh` 修改 secret 不能用 Actions 自带的 `GITHUB_TOKEN`，必须用 PAT：
+
 1. 打开 <https://github.com/settings/tokens> → **Generate new token**
-   - **Classic**：勾选 `repo`（私有仓库必需）和 `workflow` 即可，`admin:repo_hook` 不用
+   - **Classic**：勾 `repo`（私有仓库必需）和 `workflow`
    - **Fine-grained**：Repository access 选本仓库，Permissions → **Secrets: Read and write**
-2. 复制生成的 token
-3. 仓库 → **Settings → Secrets and variables → Actions → New repository secret**
-   - Name: `JLC_SECRET_PAT`
-   - Secret: 粘贴 token
+2. 仓库 → **Settings → Secrets and variables → Actions → New repository secret**
+   - Name: `JLC_SECRET_PAT`，Secret 粘贴 token
+   - ⚠️ 必须建在**仓库级**，建在 Environment 里工作流读不到
 
-`JLC_CREDENTIALS` 第一次不用建，跑完会自动创建；之后不要手工改它。
+`JLC_CREDENTIALS` 第一次不用建，跑完会自动创建，之后不要手工改。
 
-#### 怎么确认真的保存了
+#### 怎么确认保存成功
 
-运行结束后看 `Update credential secret` 这一步的日志：
+看 `Update credential secret` 这一步：
 
 ```
-凭证文件大小: 1653 字节
-updated_at: 2026-11-23 18:55:29
-账号数: 1
-  - 18894880045 cookies: 12 token: 有
+凭证文件: 1653 字节
+updated_at: 2026-11-23 18:55:29 | 账号数: 1
 凭证已回写
-JLC_CREDENTIALS    2026-11-23 18:56:07
 ```
 
-最后那行是 `gh secret list` 的输出，冒号后面是 secret 的更新时间。
-下次运行如果日志里出现 `账号 1 - 缓存凭证可用，未启动浏览器`，说明持久化生效了。
+下次运行出现 `凭证: 载入 1 个账号（来源 secret JLC_CREDENTIALS）` 和
+`账号 1 - 缓存凭证可用，未启动浏览器`，说明持久化生效了。
 
-#### 常见的「没保存」原因
+#### 没保存成功时的对照
 
 | 日志现象 | 原因 |
 | --- | --- |
-| `未配置 JLC_SECRET_PAT，JLC_CREDENTIALS 不会更新` | 没加 `JLC_SECRET_PAT`，或加在了 Environment 里而工作流没指定 environment |
-| `凭证回写失败` | PAT 过期 / 无本仓库 Secrets 写权限 / 是只读的 fork |
-| `工作区里没有 credentials.json` | 本次用的是已有凭证且未失效，本来就没必要回写（正常） |
-| 回写成功但下次仍登录 | 凭证已真正过期（Cookie 一般几天到一周），或换了 IP/UA 被判定为新设备 |
+| `本次没有产生新凭证，跳过回写` | 本次用的是仍未失效的旧凭证，本来就不需要写（正常） |
+| `未配置 JLC_SECRET_PAT` | 没建这个 secret，或建在了 Environment 里 |
+| `凭证回写失败` | PAT 过期 / 无本仓库 Secrets 写权限 / 只读 fork |
+| 回写成功但下次仍登录 | 凭证已过期（Cookie 一般几天到一周），或换 IP 被判定新设备 |
 
-凭证只存在 secret / cache 里，不会进 git（`credentials.json` 已在 `.gitignore` 中）。
+#### 失败通知
+
+工作流里 `JLC_FAIL_EXIT: 'true'`，**任意账号的积分或金豆签到失败，脚本最后返回退出码 1**，
+这一步会标红、整个 run 失败，GitHub 会给仓库关注者 / 触发者发失败邮件。
+Server酱3 推送在退出前完成，所以消息照常能收到。
 
 ---
 
@@ -341,9 +338,9 @@ python jlc.py            # 自动读 JLC_USERNAME / JLC_PASSWORD
 | `JLC_PASSWORD` | 密码，与账号一一对应 | `pwd1,pwd2` |
 | `JLC_BROWSER` | 浏览器，`chrome` 或 `edge` | `edge` |
 | `JLC_HEADLESS` | 设为 `0` 显示浏览器窗口（默认无头） | `0` |
-| `JLC_FAIL_EXIT` | 设为 `true` 时任意账号失败返回非零退出码 | `true` |
+| `JLC_FAIL_EXIT` | 设为 `true`/`1`/`yes` 时任意账号失败返回非零退出码（工作流已默认开启） | `true` |
 | `JLC_CREDENTIALS` | 上次运行留下的凭证 JSON（工作流从 secret 注入） | `{"accounts":{...}}` |
-| `JLC_CREDENTIAL_FILE` | 凭证缓存文件路径，默认 `credentials.json` | `credentials.json` |
+| `JLC_CREDENTIAL_FILE` | 凭证中转文件路径，默认 `credentials.json`（本地调试用） | `credentials.json` |
 | `SERVERCHAN3_SCKEY` | Server酱3 推送 key，多个用逗号分隔 | `sctp111tAAA` |
 
 本地第一次运行会走浏览器登录，把凭证写入 `credentials.json`；之后再运行会直接复用，

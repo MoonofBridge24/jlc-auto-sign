@@ -410,7 +410,7 @@ def _parse_credential_payload(raw, label):
     try:
         data = json.loads(raw)
     except ValueError:
-        log("凭证缓存: %s 内容不是合法 JSON，忽略" % label)
+        log("凭证: %s 内容不是合法 JSON，忽略" % label)
         return {}
 
     accounts = data.get("accounts") if isinstance(data, dict) and "accounts" in data else data
@@ -430,69 +430,40 @@ def _cred_updated_at(cred):
 
 def load_credential_cache():
     """
-    读取上次运行留下的凭证，两个来源都读，然后按账号取「更新得比较新」的那份：
-
-    - 环境变量 JLC_CREDENTIALS（工作流从 secret 注入）；
-    - 本地 credentials.json（工作流里由 actions/cache 还原）。
-
-    之所以要合并：secret 回写需要 PAT，PAT 没配或没权限时 secret 会一直是旧的，
-    而 cache 里的凭证是新的；反过来 cache 被 GitHub 淘汰时 secret 还在。
-    两边都在就不会互相拖后腿。
+    读取凭证：唯一持久化来源是 secret JLC_CREDENTIALS（工作流注入到环境变量）。
+    本地调试时没有这个环境变量，才退回到 JLC_CREDENTIAL_FILE（默认 credentials.json）。
     """
     global credential_loaded, credential_dirty
     if credential_loaded:
         return credential_cache
     credential_loaded = True
 
-    sources = []
-
     env_raw = (os.getenv("JLC_CREDENTIALS") or "").strip()
-    env_accounts = _parse_credential_payload(env_raw, "secret JLC_CREDENTIALS")
-    if env_accounts:
-        sources.append(("secret", env_accounts))
-    elif not env_raw:
-        log("凭证缓存: secret JLC_CREDENTIALS 为空")
+    accounts = {}
+    source = ""
 
-    file_accounts = {}
-    if CREDENTIAL_FILE and os.path.exists(CREDENTIAL_FILE):
+    if env_raw:
+        accounts = _parse_credential_payload(env_raw, "secret JLC_CREDENTIALS")
+        source = "secret JLC_CREDENTIALS"
+    elif CREDENTIAL_FILE and os.path.exists(CREDENTIAL_FILE):
         try:
             with open(CREDENTIAL_FILE, "r", encoding="utf-8") as fp:
-                file_accounts = _parse_credential_payload(fp.read(), CREDENTIAL_FILE)
+                accounts = _parse_credential_payload(fp.read(), CREDENTIAL_FILE)
+            source = CREDENTIAL_FILE
         except Exception as e:
-            log("凭证缓存: 读取 %s 失败: %s" % (CREDENTIAL_FILE, e))
-        if file_accounts:
-            sources.append((CREDENTIAL_FILE, file_accounts))
-    else:
-        log("凭证缓存: 本地没有 %s" % (CREDENTIAL_FILE,))
+            log("凭证: 读取 %s 失败: %s" % (CREDENTIAL_FILE, e))
 
-    if not sources:
-        log("凭证缓存: 未找到可用凭证，本次需要登录")
+    if not accounts:
+        log("凭证: 没有可用凭证，本次走登录")
         return credential_cache
 
-    # 同一个账号两边都有时，取 updated_at 更新的那份（时间格式可字典序比较）
-    taken_from = {}
-    for label, accounts in sources:
-        for username, cred in accounts.items():
-            current = credential_cache.get(username)
-            if current is None or _cred_updated_at(cred) > _cred_updated_at(current):
-                credential_cache[username] = cred
-                taken_from[username] = label
+    for username, cred in accounts.items():
+        credential_cache[str(username)] = cred
 
-    detail = "、".join("%s %d 个" % (label, len(accounts)) for label, accounts in sources)
-    log("凭证缓存: 载入 %d 个账号（%s）" % (len(credential_cache), detail))
-    for username, label in taken_from.items():
-        log("凭证缓存: 账号 %s 使用 %s 里的凭证（%s）" % (
-            mask_account(username), label,
-            _cred_updated_at(credential_cache.get(username)) or "时间未知"))
-
-    # 有账号用的是本地文件里的新凭证，说明 secret 落后了（多半是没配 PAT 或回写失败）。
-    # 标记为「有更新」，让这次跑完照样写文件、再尝试回写 secret，做到自愈。
-    if any(label != "secret" for label in taken_from.values()):
+    log("凭证: 载入 %d 个账号（来源 %s）" % (len(credential_cache), source))
+    if source != "secret JLC_CREDENTIALS":
+        # 本地调试路径：把文件里的凭证也回写到 secret 的语义上，方便直接复现
         credential_dirty = True
-        if env_accounts:
-            log("凭证缓存: secret 里的凭证比本地文件旧，本次会重新回写")
-        else:
-            log("凭证缓存: 只有本地文件里有凭证，本次会顺手回写到 secret")
     return credential_cache
 
 
@@ -531,7 +502,7 @@ def drop_cached_credentials(username, parts=('points', 'beans')):
 def save_credential_cache(usernames=None):
     """把本次拿到的可用凭证落到 credentials.json，工作流随后回写 secret。"""
     if not credential_dirty:
-        log("凭证缓存: 本次没有更新，跳过回写")
+        log("凭证: 本次没有更新，跳过回写")
         return None
 
     accounts = credential_cache
@@ -540,7 +511,7 @@ def save_credential_cache(usernames=None):
         accounts = {u: credential_cache[u] for u in usernames if u in credential_cache}
         dropped = len(credential_cache) - len(accounts)
         if dropped > 0:
-            log("凭证缓存: 清理 %d 个已不在配置里的账号" % dropped)
+            log("凭证: 清理 %d 个已不在配置里的账号" % dropped)
 
     payload = {
         "version": 1,
@@ -551,7 +522,7 @@ def save_credential_cache(usernames=None):
         with open(CREDENTIAL_FILE, "w", encoding="utf-8") as fp:
             json.dump(payload, fp, ensure_ascii=False, indent=2)
     except Exception as e:
-        log("凭证缓存: 写入 %s 失败: %s" % (CREDENTIAL_FILE, e))
+        log("凭证: 写入 %s 失败: %s" % (CREDENTIAL_FILE, e))
         return None
 
     try:
@@ -559,7 +530,7 @@ def save_credential_cache(usernames=None):
     except OSError:
         size = -1
 
-    log("凭证缓存: 已更新 %d 个账号 → %s（%d 字节，工作流会回写到 secret）" % (
+    log("凭证: 已更新 %d 个账号 → %s（%d 字节，工作流会回写到 secret）" % (
         len(accounts), CREDENTIAL_FILE, size))
     return CREDENTIAL_FILE
 
@@ -1174,7 +1145,6 @@ def sign_with_credentials(creds, account_index, result, only=None):
             result['oshwhub_message'] = '没有 oshwhub Cookie'
             expired.append('points')
         else:
-            log("账号 %s - 请求积分签到接口（Cookie 方式）..." % account_index)
             # 先按浏览器原样发（带全 WAF 会话 Cookie）；被拒再退回只用会话 Cookie，
             # 因为缓存凭证里的 WAF Cookie 可能属于上一台机器/上一个时段。
             header_options = [cookie_header, ''] if cookie_header else ['']
@@ -1234,7 +1204,6 @@ def sign_with_credentials(creds, account_index, result, only=None):
             result['jindou_message'] = '没有 X-JLC-AccessToken'
             expired.append('beans')
         else:
-            log("账号 %s - 请求金豆签到接口（Token 方式）..." % account_index)
             try:
                 res = JlcBeanClient(
                     token,
@@ -1398,10 +1367,6 @@ def process_single_account(username, password, account_index, total_accounts):
 
 def execute_final_retry_for_failed_accounts(all_results, usernames, passwords, total_accounts):
     """对仍然失败的账号做最后一次重试（排除密码错误）"""
-    log("=" * 70)
-    log("执行最终重试 - 处理仍失败的账号")
-    log("=" * 70)
-
     failed = [r for r in all_results
               if (not r['oshwhub_success'] or not r['jindou_success'])
               and not r.get('password_error', False)]
@@ -1410,12 +1375,12 @@ def execute_final_retry_for_failed_accounts(all_results, usernames, passwords, t
         log("没有需要最终重试的账号")
         return all_results
 
-    log("需要最终重试的账号: %s" % ', '.join(str(r['account_index']) for r in failed))
+    log("最终重试：%d 个账号（序号 %s）" % (
+        len(failed), '、'.join(str(r['account_index']) for r in failed)))
     time.sleep(random.randint(2, 3))
 
     for pos, original in enumerate(failed):
         account_index = original['account_index']
-        log("开始最终重试账号 %s" % account_index)
 
         final_result = sign_in_account(
             usernames[account_index - 1],
@@ -1440,9 +1405,7 @@ def execute_final_retry_for_failed_accounts(all_results, usernames, passwords, t
                 account_index, original['oshwhub_status'], original['jindou_status']))
 
         if pos < len(failed) - 1:
-            wait_time = random.randint(2, 4)
-            log("等待 %s 秒后处理下一个重试账号..." % wait_time)
-            time.sleep(wait_time)
+            time.sleep(random.randint(2, 4))
 
     log("最终重试完成")
     return all_results
@@ -1792,21 +1755,19 @@ def main():
             print("示例: python jlc.py user1,user2,user3 pwd1,pwd2,pwd3")
             print("示例: python jlc.py user1,user2,user3 pwd1,pwd2,pwd3 true")
             print("或改用环境变量: JLC_USERNAME=账号1,账号2  JLC_PASSWORD=密码1,密码2  JLC_FAIL_EXIT=true")
-            print("失败退出标志: 不传或任意值-关闭, true-开启(任意账号签到失败时返回非零退出码)")
+            print("失败退出标志: true/1/yes/on-开启(任意账号签到失败时返回非零退出码), 其他-关闭")
             sys.exit(1)
-        log("已从环境变量 JLC_USERNAME / JLC_PASSWORD 读取账号")
 
-    # 解析失败退出标志，默认为关闭
-    enable_failure_exit = (failure_flag or '').lower() == 'true'
-    
-    log(f"失败退出功能: {'开启' if enable_failure_exit else '关闭'}")
+    # 失败退出标志：任意账号签到失败时返回非零退出码（Actions 会据此发失败邮件）
+    enable_failure_exit = (failure_flag or '').strip().lower() in ('1', 'true', 'yes', 'on')
     
     if len(usernames) != len(passwords):
         log("错误: 账号和密码数量不匹配!")
         sys.exit(1)
     
     total_accounts = len(usernames)
-    log(f"开始处理 {total_accounts} 个账号的签到任务")
+    log("开始签到：%d 个账号｜失败退出：%s" % (
+        total_accounts, "开启" if enable_failure_exit else "关闭"))
 
     # 载入上次留下的凭证（工作流从 JLC_CREDENTIALS secret 注入）
     load_credential_cache()
@@ -1815,7 +1776,6 @@ def main():
     all_results = []
     
     for i, (username, password) in enumerate(zip(usernames, passwords), 1):
-        log(f"开始处理第 {i} 个账号")
         result = process_single_account(username, password, i, total_accounts)
         all_results.append(result)
         
@@ -1830,123 +1790,62 @@ def main():
     if has_failed_accounts:
         all_results = execute_final_retry_for_failed_accounts(all_results, usernames, passwords, total_accounts)
     
-    # 输出详细总结
-    log("=" * 70)
-    in_summary = True  # 启用总结收集
-    log("详细签到任务完成总结")
-    log("=" * 70)
-    
+    # 总结：一行一个账号，只打印必要信息
+    log("=" * 62)
+    in_summary = True
+
     oshwhub_success_count = 0
     jindou_success_count = 0
     total_points_reward = 0
     total_jindou_reward = 0
-    retried_accounts = []  # 合并所有重试过的账号，包括最终重试
-    password_error_accounts = []  # 密码错误的账号
-    
-    # 记录失败的账号
     failed_accounts = []
-    
+    password_error_accounts = []
+
+    def _masked(index):
+        if 0 < index <= len(usernames):
+            return mask_account(usernames[index - 1])
+        return "账号%s" % index
+
+    log("签到结果")
     for result in all_results:
-        account_index = result['account_index']
-        nickname = result.get('nickname', '未知')
-        retry_count = result.get('retry_count', 0)
-        is_final_retry = result.get('is_final_retry', False)
-        password_error = result.get('password_error', False)
-        
-        if password_error:
-            password_error_accounts.append(account_index)
-        
-        if retry_count > 0 or is_final_retry:
-            retried_accounts.append(account_index)
-        
-        # 检查是否有失败情况（排除密码错误）
-        if (not result['oshwhub_success'] or not result['jindou_success']) and not password_error:
-            failed_accounts.append(account_index)
-        
-        retry_label = ""
-        if retry_count > 0:
-             retry_label = f" [重试{retry_count}次]"
-        elif is_final_retry:
-            retry_label = " [最终重试]"
-        
-        # 密码错误账号的特殊显示
-        if password_error:
-            log(f"账号 {account_index} (未知) 详细结果: [密码错误]")
-            log("  └── 状态: 账号或密码错误，跳过此账号")
-        else:
-            log(f"账号 {account_index} ({nickname}) 详细结果:{retry_label}")
-            log(f"  ├── 开源平台: {result['oshwhub_status']}")
-            
-            # 显示积分变化
-            if result['points_reward'] > 0:
-                log(f"  ├── 积分变化: {result['initial_points']} → {result['final_points']} (+{result['points_reward']})")
-                total_points_reward += result['points_reward']
-            elif result['oshwhub_success']:
-                log(f"  ├── 积分变化: {result['initial_points']} → {result['final_points']} (0)")
-            else:
-                log("  ├── 积分状态: 无法获取积分信息")
-            
-            log(f"  ├── 金豆签到: {result['jindou_status']}")
-            
-            # 显示金豆变化
-            if result['jindou_reward'] > 0:
-                jindou_text = f"  ├── 金豆变化: {result['initial_jindou']} → {result['final_jindou']} (+{result['jindou_reward']})"
-                if result['has_jindou_reward']:
-                    jindou_text += "（有奖励）"
-                log(jindou_text)
-                total_jindou_reward += result['jindou_reward']
-            elif result['jindou_success']:
-                log(f"  ├── 金豆变化: {result['initial_jindou']} → {result['final_jindou']} (0)")
-            else:
-                log("  ├── 金豆状态: 无法获取金豆信息")
-            
-            log(f"  ├── 凭证来源: {result.get('credential_source', '未知')}")
-            
-            if result['oshwhub_success']:
-                oshwhub_success_count += 1
-            if result['jindou_success']:
-                jindou_success_count += 1
-        
-        log("  " + "-" * 50)
-    
-    # 总体统计
-    log("总体统计:")
-    log(f"  ├── 总账号数: {total_accounts}")
-    log(f"  ├── 开源平台签到成功: {oshwhub_success_count}/{total_accounts}")
-    log(f"  ├── 金豆签到成功: {jindou_success_count}/{total_accounts}")
-    
-    if total_points_reward > 0:
-        log(f"  ├── 总计获得积分: +{total_points_reward}")
-    
-    if total_jindou_reward > 0:
-        log(f"  ├── 总计获得金豆: +{total_jindou_reward}")
-    
-    # 计算成功率
-    oshwhub_rate = (oshwhub_success_count / total_accounts) * 100 if total_accounts > 0 else 0
-    jindou_rate = (jindou_success_count / total_accounts) * 100 if total_accounts > 0 else 0
-    
-    log(f"  ├── 开源平台成功率: {oshwhub_rate:.1f}%")
-    log(f"  └── 金豆签到成功率: {jindou_rate:.1f}%")
-    
-    # 失败账号列表（排除密码错误）
-    failed_oshwhub = [r['account_index'] for r in all_results if not r['oshwhub_success'] and not r.get('password_error', False)]
-    failed_jindou = [r['account_index'] for r in all_results if not r['jindou_success'] and not r.get('password_error', False)]
-    
-    if failed_oshwhub:
-        log(f"  开源平台失败账号: {', '.join(map(str, failed_oshwhub))}")
-    
-    if failed_jindou:
-        log(f"  金豆签到失败账号: {', '.join(map(str, failed_jindou))}")
-        
-    if password_error_accounts:
-        log(f"  × 密码错误的账号: {', '.join(map(str, password_error_accounts))}")
-       
-    if not failed_oshwhub and not failed_jindou and not password_error_accounts:
-        log("  所有账号全部签到成功!")
-    elif password_error_accounts and not failed_oshwhub and not failed_jindou:
-        log("  √ 除了密码错误账号，其他账号全部签到成功!")
-    
-    log("=" * 70)
+        index = result['account_index']
+        account = _masked(index)
+
+        if result.get('password_error'):
+            password_error_accounts.append(index)
+            log("  ❌ 账号(%s)：账号或密码错误" % account)
+            continue
+
+        if result['oshwhub_success']:
+            oshwhub_success_count += 1
+        if result['jindou_success']:
+            jindou_success_count += 1
+        total_points_reward += result.get('points_reward') or 0
+        total_jindou_reward += result.get('jindou_reward') or 0
+
+        kind, line = _account_line(account, result)
+        if kind == 'failed':
+            failed_accounts.append(index)
+
+        note = ""
+        if result.get('is_final_retry'):
+            note = "（重试后）"
+        elif result.get('retry_count'):
+            note = "（重试%s次）" % result['retry_count']
+        log("  " + line + note)
+
+    log("-" * 62)
+    log("汇总：积分 %s/%s，金豆 %s/%s，共得积分 +%s、金豆 +%s" % (
+        oshwhub_success_count, total_accounts,
+        jindou_success_count, total_accounts,
+        _fmt_reward(total_points_reward), _fmt_reward(total_jindou_reward)))
+
+    all_failed_accounts = failed_accounts + password_error_accounts
+    if all_failed_accounts:
+        log("失败账号：%s" % "、".join(_masked(i) for i in sorted(all_failed_accounts)))
+    else:
+        log("全部账号签到成功")
+    log("=" * 62)
 
     # 先回写凭证（工作流随后更新 secret），再推送总结
     try:
@@ -1960,20 +1859,11 @@ def main():
     except Exception as e:
         log(f"推送总结时出现异常: {e}")
     
-    # 根据失败退出标志决定退出码
-    all_failed_accounts = failed_accounts + password_error_accounts
+    # 任意账号失败 → 非零退出码：Actions 会标红这一步，并触发失败通知邮件
     if enable_failure_exit and all_failed_accounts:
-        log(f"检测到失败的账号: {', '.join(map(str, all_failed_accounts))}")
-        if password_error_accounts:
-            log(f"其中密码错误的账号: {', '.join(map(str, password_error_accounts))}")
-        log("由于失败退出功能已开启，返回报错退出码以获得邮件提醒")
+        log("退出码 1：%d 个账号签到失败" % len(all_failed_accounts))
         sys.exit(1)
-    else:
-        if enable_failure_exit:
-            log("所有账号签到成功，程序正常退出")
-        else:
-            log("程序正常退出")
-        sys.exit(0)
+    sys.exit(0)
 
 if __name__ == "__main__":
     main()
