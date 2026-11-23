@@ -277,6 +277,40 @@ JLC_BROWSER=edge JLC_HEADLESS=0 JLC_USERNAME=13800138000 JLC_PASSWORD=你的密�
 - **滑块一直「验证失败」**：先确认 `stealth.py` 注入成功（`window.cdc_*` 标记已抹掉），并检查是否误加了 `--blink-settings=imagesEnabled=false`（会让滑块背景图不渲染、尺寸变 0）。
 - **想看错误现场**：加 `JLC_HEADLESS=0`，或给 `test_captcha.py` 加 `--keep`，浏览器不会自动关，可以直接在窗口里操作。
 
+#### 6. 无头模式 / GitHub Actions 注意事项
+
+无头模式最容易踩的坑是 **UA 请求头里的 `HeadlessChrome`**：
+
+- `--headless` 启动的浏览器，HTTP 请求头里的 User-Agent 是 `...HeadlessChrome/xxx...`；
+- 只在页面里改 `navigator.userAgent` 没用，服务端和 WAF 看的是请求头；
+- oshwhub 的 WAF（瑞数 CloudWAF）会把这类请求直接拦掉，返回 **418「访问被拦截！」**，
+  表现为：登录明明成功、也跳回了签到页，但 `/api/users` 取不到昵称和积分，后续签到全失败。
+
+脚本已在 `create_driver()` 里用 CDP `Emulation.setUserAgentOverride` 在会话层覆盖 UA
+（自动取当前浏览器真实版本，去掉 `Headless` 字样，不写死版本号），Windows / Ubuntu 都适用。
+启动时会打印：
+
+```
+[18:13:26] 已覆盖无头 UA 请求头（去掉 Headless 标识）
+```
+
+如果看到的是 `警告: UA 覆盖未生效`，说明当前驱动不支持 CDP，需要升级浏览器或驱动。
+
+排查顺序（无头失败时按这个走）：
+
+1. 日志里有 `422/418`、`访问被拦截`、`/api/users 被 WAF 拦截` → UA / 指纹问题；
+2. 日志里 `/api/users` 是 `401` → 会话没建立，看上面的登录流程；
+3. `无法获取用户昵称` 后面紧跟着签到失败 → 基本就是第 1 条。
+
+另外无头模式的 `screen` 会报成 800×600（窗口却是 1920×1080），`stealth.py` 会一起修正，
+避免「高分辨率窗口 + 十几年前的分辨率」这种明显矛盾。
+
+GitHub Actions（ubuntu-22.04 + Chrome + selenium 3.141）额外注意：
+
+- 工作流里不需要装 xvfb，脚本本身就是无头；
+- Chrome 低于 109 时 `--headless=new` 会被自动降级成 `--headless`；
+- 服务器 IP 属于机房段，风控更严，偶尔需要重试，脚本自带重试逻辑。
+
 ---
 
 ### 成功运行结果（节选）

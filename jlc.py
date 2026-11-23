@@ -33,6 +33,9 @@ BROWSER = os.getenv("JLC_BROWSER", "chrome").strip().lower()
 SELENIUM_MAJOR = int(str(getattr(selenium, "__version__", "4")).split(".")[0])
 
 
+# 浏览器真实 UA（无头模式被 CDP 覆盖后的值），供 requests 侧统一使用
+BROWSER_UA = ""
+
 # 全局变量用于收集总结日志
 in_summary = False
 summary_logs = []
@@ -42,6 +45,78 @@ def log(msg):
     print(full_msg, flush=True)
     if in_summary:
         summary_logs.append(msg)  # 只收集纯消息，无时间戳
+
+def _apply_ua_override(driver):
+    """
+    无头模式下把 UA 里的 HeadlessChrome 改掉（会话级，UA 请求头一起改）。
+
+    这是「有头能过、无头过不去」的根因：--headless 启动的浏览器，HTTP 请求头里
+    的 User-Agent 是 "...HeadlessChrome/158.0.0.0..."。只在 JS 里改 navigator.userAgent
+    没用——服务端和 WAF 看的是请求头，于是 oshwhub 的瑞数 CloudWAF 直接返回
+    418「访问被拦截！」，登录后取用户信息、签到接口全部失败。
+
+    用 CDP 在会话层覆盖，UA 请求头和 navigator.userAgent 会同时生效，
+    且不写死版本号：直接取当前浏览器的真实 UA，去掉 Headless 字样。
+    Linux（GitHub Actions）下也就自然得到 X11; Linux x86_64 的正常 UA。
+    """
+    if not hasattr(driver, "execute_cdp_cmd"):
+        return
+    ua = ""
+    try:
+        info = driver.execute_cdp_cmd("Browser.getVersion", {}) or {}
+        ua = info.get("userAgent") or ""
+    except Exception:
+        # 个别驱动不支持 Browser.getVersion，退回页面里的 UA
+        ua = ""
+
+    if not ua:
+        try:
+            ua = driver.execute_script("return navigator.userAgent;") or ""
+        except Exception:
+            return
+
+    if "Headless" not in ua:
+        return
+
+    clean = ua.replace("HeadlessChrome", "Chrome").replace("Headless", "")
+    global BROWSER_UA
+    BROWSER_UA = clean
+    if "Windows" in clean:
+        platform = "Win32"
+    elif "Linux" in clean:
+        platform = "Linux x86_64"
+    else:
+        platform = "MacIntel"
+
+    for cmd in ("Emulation.setUserAgentOverride", "Network.setUserAgentOverride"):
+        try:
+            driver.execute_cdp_cmd(cmd, {
+                "userAgent": clean,
+                "acceptLanguage": "zh-CN,zh;q=0.9,en;q=0.8",
+                "platform": platform,
+            })
+            log("已覆盖无头 UA 请求头（去掉 Headless 标识）")
+            try:
+                now = driver.execute_script("return navigator.userAgent;") or ""
+                if "Headless" in now:
+                    log("警告: UA 覆盖未生效，当前 UA 仍含 Headless，"
+                        "登录后接口可能被 WAF 拦截")
+            except Exception:
+                pass
+            return
+        except Exception:
+            continue
+
+
+def _current_ua(driver):
+    """取当前浏览器的 UA（优先用 CDP 覆盖后的值），避免请求头与浏览器不一致"""
+    if BROWSER_UA:
+        return BROWSER_UA
+    try:
+        return driver.execute_script("return navigator.userAgent;") or ""
+    except Exception:
+        return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "               "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
 
 def create_driver():
     """
@@ -100,7 +175,11 @@ def create_driver():
         opts.add_argument("--headless")
         driver = _build()
 
-    # 抹掉驱动特征（cdc_* / navigator.webdriver 等），否则阿里云滑块必被判风险
+    # 先修 UA 请求头：无头模式的 HeadlessChrome 会被 WAF 直接拦掉（418）
+    if HEADLESS:
+        _apply_ua_override(driver)
+
+    # 再抹掉驱动特征（cdc_* / navigator.webdriver 等），否则阿里云滑块必被判风险
     if stealth:
         stealth.apply(driver)
 
@@ -228,13 +307,17 @@ def get_oshwhub_points(driver, account_index):
             cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
             
             headers = {
-                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'user-agent': _current_ua(driver),
                 'accept': 'application/json, text/plain, */*',
+                'referer': 'https://oshwhub.com/sign_in',
                 'cookie': cookie_str
             }
             
             # 调用用户信息API获取积分
             response = requests.get("https://oshwhub.com/api/users", headers=headers, timeout=10)
+            if response.status_code == 418:
+                log(f"账号 {account_index} - /api/users 被 WAF 拦截(418)，"
+                    f"通常是 UA/指纹被判为自动化")
             if response.status_code == 200:
                 data = response.json()
                 if data and data.get('success'):
@@ -261,7 +344,7 @@ class JLCClient:
     def __init__(self, access_token, secretkey, account_index, driver):
         self.base_url = "https://m.jlc.com"
         self.headers = {
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'user-agent': _current_ua(driver),
             'x-jlc-clienttype': 'WEB',
             'accept': 'application/json, text/plain, */*',
             'x-jlc-accesstoken': access_token,
@@ -582,35 +665,94 @@ def click_gift_buttons(driver, account_index):
     return reward_results
 
 @with_retry
-def get_user_nickname_from_api(driver, account_index):
-    """通过API获取用户昵称"""
+def _api_via_browser(driver, url):
+    """
+    在页面内用 fetch 请求接口，自动继承浏览器的 Cookie / Origin / Referer / UA。
+
+    返回 {'status': int, 'body': str}，status 为 -1 表示请求本身没发出去。
+    """
+    script = """
+    var url = arguments[0], done = arguments[arguments.length - 1];
+    fetch(url, {
+      credentials: 'include',
+      headers: { 'accept': 'application/json, text/plain, */*' }
+    }).then(function (r) {
+      return r.text().then(function (t) {
+        done({ status: r.status, body: (t || '').slice(0, 1200) });
+      });
+    }).catch(function (e) {
+      done({ status: -1, body: 'fetch 异常: ' + String(e).slice(0, 200) });
+    });
+    """
     try:
-        # 获取当前页面的Cookie
+        driver.set_script_timeout(20)
+        result = driver.execute_async_script(script, url)
+        if isinstance(result, dict):
+            return result
+        return {"status": -1, "body": "返回值异常: %r" % (result,)}
+    except Exception as e:
+        return {"status": -1, "body": "执行 fetch 失败: %s" % str(e).splitlines()[0][:200]}
+
+
+def get_user_nickname_from_api(driver, account_index):
+    """
+    通过 /api/users 获取用户昵称。
+
+    原来是手工拼 Cookie 头交给 requests，有三个问题：
+    - UA 被写死成 Chrome/120，跟实际浏览器（Edge/158）对不上；
+    - 不带 Origin / Referer，服务端容易判成非浏览器请求；
+    - 失败时只打印「无法获取用户昵称」，看不到状态码，无法排查。
+    现在优先在页面内 fetch（真实上下文），失败再退回 requests 并打印状态码。
+    """
+    resp = _api_via_browser(driver, "https://oshwhub.com/api/users")
+    status, body = resp.get("status"), resp.get("body") or ""
+
+    data = None
+    if status == 200:
+        try:
+            data = json.loads(body)
+        except Exception:
+            data = None
+
+    if data and data.get("success"):
+        nickname = (data.get("result") or {}).get("nickname", "")
+        if nickname:
+            formatted_nickname = format_nickname(nickname)
+            log(f"账号 {account_index} - 昵称: {formatted_nickname}")
+            return formatted_nickname
+
+    # 页面内请求失败时，退回 requests 再试一次（保留旧路径，兼容个别环境）
+    try:
         cookies = driver.get_cookies()
-        cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-        
+        cookie_str = "; ".join(["%s=%s" % (c["name"], c["value"]) for c in cookies])
+        ua = driver.execute_script("return navigator.userAgent;") or ""
         headers = {
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'accept': 'application/json, text/plain, */*',
-            'cookie': cookie_str
+            "user-agent": ua,
+            "accept": "application/json, text/plain, */*",
+            "referer": "https://oshwhub.com/sign_in",
+            "cookie": cookie_str,
         }
-        
-        # 调用用户信息API
-        response = requests.get("https://oshwhub.com/api/users", headers=headers, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            if data and data.get('success'):
-                nickname = data.get('result', {}).get('nickname', '')
+        r = requests.get("https://oshwhub.com/api/users", headers=headers, timeout=10)
+        log(f"账号 {account_index} - /api/users 页面内请求 status={status}，"
+            f"requests 重试 status={r.status_code}")
+        if r.status_code == 200:
+            fallback = r.json()
+            if fallback and fallback.get("success"):
+                nickname = (fallback.get("result") or {}).get("nickname", "")
                 if nickname:
                     formatted_nickname = format_nickname(nickname)
                     log(f"账号 {account_index} - 昵称: {formatted_nickname}")
                     return formatted_nickname
-        
-        log(f"账号 {account_index} - 无法获取用户昵称")
-        return None
+        if status == 418:
+            log(f"账号 {account_index} - /api/users 被 WAF 拦截(418)，"
+                f"说明无头 UA / 指纹仍被识别为自动化")
+        log(f"账号 {account_index} - /api/users 返回内容(status={status}): {str(body)[:200]}")
     except Exception as e:
-        log(f"账号 {account_index} - 获取用户昵称失败: {e}")
-        return None
+        log(f"账号 {account_index} - /api/users 备用请求异常: {str(e).splitlines()[0][:120]}")
+
+    log(f"账号 {account_index} - 无法获取用户昵称")
+    return None
+
 
 PASSPORT_LOGIN_FALLBACK = (
     "https://passport.jlc.com/login?appId=JLC_OSHWHUB"
@@ -739,7 +881,9 @@ def check_password_error(driver, account_index, timeout=2.5):
     这里改成直接读 body 文本轮询，通常几十毫秒就能判定。
     """
     keywords = ('账号或密码不正确', '用户名或密码错误', '密码错误',
-                '账号或密码错误', '登录失败')
+                '账号或密码错误', '登录失败',
+                # 风控限流：继续重试只会越试越久，直接判定这个账号本次不可用
+                '次数过多', '分钟后再试', '登录异常')
     deadline = time.time() + timeout
     while True:
         try:
@@ -751,7 +895,7 @@ def check_password_error(driver, account_index, timeout=2.5):
 
         for kw in keywords:
             if kw in page_text:
-                log(f"账号 {account_index} - 检测到账号或密码错误，跳过此账号")
+                log(f"账号 {account_index} - 检测到登录被拒（{kw}），跳过此账号")
                 return True
 
         if time.time() >= deadline:
@@ -1690,12 +1834,12 @@ def main():
         log(f"  金豆签到失败账号: {', '.join(map(str, failed_jindou))}")
         
     if password_error_accounts:
-        log(f"  ?密码错误的账号: {', '.join(map(str, password_error_accounts))}")
+        log(f"  × 密码错误的账号: {', '.join(map(str, password_error_accounts))}")
        
     if not failed_oshwhub and not failed_jindou and not password_error_accounts:
         log("  所有账号全部签到成功!")
     elif password_error_accounts and not failed_oshwhub and not failed_jindou:
-        log("  ?除了密码错误账号，其他账号全部签到成功!")
+        log("  √ 除了密码错误账号，其他账号全部签到成功!")
     
     log("=" * 70)
     

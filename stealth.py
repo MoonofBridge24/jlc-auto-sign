@@ -72,7 +72,30 @@ INIT_SCRIPT = r"""
   if (!window.chrome.runtime) { window.chrome.runtime = {}; }
   if (!window.chrome.app) { window.chrome.app = { isInstalled: false }; }
 
-  // 5. 语言 / plugins
+  // 5. 无头模式的屏幕尺寸（--headless 下 screen 会报成 800x600，
+  //    而窗口是 1920x1080，这种「1440p 窗口 + 15 年前的分辨率」本身就是特征）
+  try {
+    var sw = window.screen;
+    var W = Math.max(window.outerWidth || 0, 1920);
+    var H = Math.max(window.outerHeight || 0, 1080);
+    var fix = function (obj, prop, value) {
+      try {
+        rawDef.call(Object, obj, prop, { get: function () { return value; }, configurable: true });
+      } catch (e) {}
+    };
+    if (sw && sw.width < 1024) {
+      fix(sw, 'width', W);
+      fix(sw, 'height', H);
+      fix(sw, 'availWidth', W);
+      fix(sw, 'availHeight', H - 40);   // 任务栏
+      fix(sw, 'availLeft', 0);
+      fix(sw, 'availTop', 0);
+      fix(sw, 'colorDepth', 24);
+      fix(sw, 'pixelDepth', 24);
+    }
+  } catch (e) {}
+
+  // 6. 语言 / plugins
   try {
     rawDef.call(Object, navigator, 'languages', {
       get: function () { return ['zh-CN', 'zh', 'en']; }, configurable: true
@@ -84,7 +107,7 @@ INIT_SCRIPT = r"""
     }
   } catch (e) {}
 
-  // 6. 权限查询（无头环境常返回 denied，正常浏览器是 prompt）
+  // 7. 权限查询（无头环境常返回 denied，正常浏览器是 prompt）
   try {
     var perms = navigator.permissions;
     var origQuery = perms && perms.query;
