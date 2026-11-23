@@ -36,7 +36,29 @@ jobs:
 
       - name: 'Working'
         env:
+          # 上次运行留下的凭证（JSON）。为空时本次会走浏览器登录
+          JLC_CREDENTIALS: ${{ secrets.JLC_CREDENTIALS }}
           # Server酱3 推送（可选）：不配置该 secret 则跳过推送
           SERVERCHAN3_SCKEY: ${{ secrets.SERVERCHAN3_SCKEY }}
+          JLC_CREDENTIAL_FILE: credentials.json
         run: |
           python ./jlc.py ${{ secrets.JLC_USERNAME }} ${{ secrets.JLC_PASSWORD }}
+
+      - name: 'Update credential secret'
+        # 登录拿到的 Cookie / Token 在下一次运行时可以复用，省掉一次浏览器登录
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.JLC_SECRET_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "未配置 JLC_SECRET_PAT，跳过凭证回写（下次运行会重新登录）"
+            exit 0
+          fi
+          if [ ! -s credentials.json ]; then
+            echo "本次没有产生新凭证，跳过回写"
+            exit 0
+          fi
+          gh secret set JLC_CREDENTIALS < credentials.json \
+            && echo "已更新 JLC_CREDENTIALS" \
+            || echo "凭证回写失败（检查 JLC_SECRET_PAT 是否有 Secrets 写权限），本次签到结果不受影响"
+          rm -f credentials.json

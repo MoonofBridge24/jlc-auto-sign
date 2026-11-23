@@ -14,6 +14,10 @@ screenshots/
 *.log
 .env
 .env.*
+# 登录凭证缓存（含 Cookie / Token，绝对不能提交）
+credentials.json
+credentials-*.json
+.tmp_*.py
 
 # ---- 编辑器 / 系统 ----
 .idea/
