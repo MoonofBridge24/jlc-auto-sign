@@ -8,7 +8,7 @@ import shutil
 import random
 import requests
 import selenium
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
@@ -399,6 +399,18 @@ def _now_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+# 签到按「东八区自然日」算：不依赖 runner 的时区设置，中国没有夏令时，固定 +8 即可
+CN_TZ = timezone(timedelta(hours=8))
+
+
+def _cn_now():
+    return datetime.now(CN_TZ)
+
+
+def _cn_today():
+    return _cn_now().strftime("%Y-%m-%d")
+
+
 def _parse_credential_payload(raw, label):
     """
     解析一份凭证 JSON。格式：
@@ -426,6 +438,64 @@ def _parse_credential_payload(raw, label):
 
 def _cred_updated_at(cred):
     return (cred or {}).get("updated_at") or ""
+
+
+def already_signed_today(creds):
+    """
+    看这份凭证里是否已有「东八区今天、积分和金豆都完成」的记录。
+    命中返回记录 dict，否则 None。日期是东八区自然日，跨天后自动失效。
+    """
+    info = (creds or {}).get("last_sign")
+    if not isinstance(info, dict):
+        return None
+    if info.get("date") != _cn_today():
+        return None
+    if not info.get("complete"):
+        return None
+    return info
+
+
+def record_sign_success(username, result, account_index=None):
+    """
+    把「今日签到完成」的时间与结果写进该账号凭证，随 JLC_CREDENTIALS 一起持久化。
+    只有积分、金豆两边都成功才置 complete=True——不完整就不要在当天跳过。
+    """
+    global credential_dirty
+    cred = credential_cache.get(username) or {}
+    now = _cn_now()
+
+    record = {
+        "date": now.strftime("%Y-%m-%d"),
+        "at": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "points": {
+            "ok": bool(result.get("oshwhub_success")),
+            "status": result.get("oshwhub_status") or "",
+            "balance": result.get("final_points") or 0,
+            "reward": result.get("points_reward") or 0,
+        },
+        "beans": {
+            "ok": bool(result.get("jindou_success")),
+            "status": result.get("jindou_status") or "",
+            "balance": result.get("final_jindou") or 0,
+            "reward": result.get("jindou_reward") or 0,
+        },
+        "complete": bool(result.get("oshwhub_success") and result.get("jindou_success")),
+    }
+
+    gifts = [g.get("name") for g in (result.get("gifts") or [])
+             if isinstance(g, dict) and g.get("status") == "ok" and g.get("name")]
+    if gifts:
+        record["gifts"] = gifts[:5]
+
+    cred["last_sign"] = record
+    credential_cache[username] = cred
+    credential_dirty = True
+
+    label = "账号 %s" % account_index if account_index else "账号"
+    log("%s - 已写入今日签到记录（%s，积分 %s / 金豆 %s）" % (
+        label, record["at"],
+        record["points"]["balance"], record["beans"]["balance"]))
+    return record
 
 
 def load_credential_cache():
@@ -473,6 +543,11 @@ def get_cached_credentials(username):
 
 def set_cached_credentials(username, creds):
     global credential_dirty
+    creds = creds or {}
+    # 新凭证只有 Cookie / token，把今天已有的签到记录带过去，避免回写 secret 时丢掉
+    old = credential_cache.get(username) or {}
+    if old.get('last_sign') and not creds.get('last_sign'):
+        creds['last_sign'] = old['last_sign']
     credential_cache[username] = creds
     credential_dirty = True
 
@@ -518,6 +593,8 @@ def save_credential_cache(usernames=None):
         "updated_at": _now_text(),
         "accounts": accounts,
     }
+    done_today = sum(1 for c in accounts.values()
+                     if isinstance(c, dict) and already_signed_today(c))
     try:
         with open(CREDENTIAL_FILE, "w", encoding="utf-8") as fp:
             json.dump(payload, fp, ensure_ascii=False, indent=2)
@@ -532,6 +609,8 @@ def save_credential_cache(usernames=None):
 
     log("凭证: 已更新 %d 个账号 → %s（%d 字节，工作流会回写到 secret）" % (
         len(accounts), CREDENTIAL_FILE, size))
+    if done_today:
+        log("凭证: 其中 %d 个账号已记录今日（东八区）签到完成" % done_today)
     return CREDENTIAL_FILE
 
 
@@ -960,6 +1039,11 @@ def _empty_account_result(account_index, retry_count=0, is_final_retry=False):
         'retry_count': retry_count,
         'is_final_retry': is_final_retry,
         'password_error': False,
+        # 今日已完成（凭证里有当天的完成记录）→ 本次直接跳过，不再发签到请求
+        'skipped_today': False,
+        'last_sign_at': '',
+        # 本次运行是否真的产生了新的签到成功记录（用于决定要不要推送）
+        'signed_now': False,
     }
 
 
@@ -1235,6 +1319,45 @@ def sign_with_credentials(creds, account_index, result, only=None):
     return expired
 
 
+def _mark_already_done(result, record, account_index):
+    """凭证里已有今天的完成记录：直接按「已签到」收尾，不发任何请求"""
+    points = record.get('points') or {}
+    beans = record.get('beans') or {}
+
+    result['skipped_today'] = True
+    result['credential_source'] = '缓存'
+    result['last_sign_at'] = record.get('at') or ''
+
+    result['oshwhub_success'] = True
+    result['oshwhub_status'] = points.get('status') or '今日已完成'
+    result['initial_points'] = points.get('balance') or 0
+    result['final_points'] = points.get('balance') or 0
+    result['points_reward'] = 0
+
+    result['jindou_success'] = True
+    result['jindou_status'] = beans.get('status') or '今日已完成'
+    result['initial_jindou'] = beans.get('balance') or 0
+    result['final_jindou'] = beans.get('balance') or 0
+    result['jindou_reward'] = 0
+
+    log("账号 %s - 东八区今天（%s）积分与金豆均已完成，跳过签到" % (
+        account_index, record.get('at') or '时间未知'))
+    return result
+
+
+def _finish_account(username, result, account_index):
+    """
+    收尾：两边都成功的账号，把「今天已完成」写进凭证（随 secret 持久化）。
+    只有真的跑了签到（不是今日已完成跳过）才标记 signed_now，推送据此判断有没有新记录。
+    """
+    if (result.get('oshwhub_success') and result.get('jindou_success')
+            and not result.get('skipped_today')):
+        record = record_sign_success(username, result, account_index)
+        result['signed_now'] = True
+        result['last_sign_at'] = record.get('at') or ''
+    return result
+
+
 def sign_in_account(username, password, account_index, total_accounts,
                     retry_count=0, is_final_retry=False):
     """
@@ -1252,6 +1375,11 @@ def sign_in_account(username, password, account_index, total_accounts,
     # 1. 先看上次留下的凭证
     creds = get_cached_credentials(username)
 
+    # 0. 东八区今天已经积分+金豆都完成过 → 直接跳过（不发请求、不登录）
+    done_today = already_signed_today(creds)
+    if done_today:
+        return _mark_already_done(result, done_today, account_index)
+
     if creds:
         updated = creds.get('updated_at') or '时间未知'
         log("账号 %s - 使用缓存凭证（更新于 %s），先验证" % (account_index, updated))
@@ -1260,7 +1388,7 @@ def sign_in_account(username, password, account_index, total_accounts,
 
         if result['oshwhub_success'] and result['jindou_success']:
             log("账号 %s - 缓存凭证可用，未启动浏览器" % account_index)
-            return result
+            return _finish_account(username, result, account_index)
 
         # 任何一边没签成功都重新登录（凭证可能只是部分失效，或接口需要新 Cookie）
         need = []
@@ -1279,7 +1407,7 @@ def sign_in_account(username, password, account_index, total_accounts,
         log("账号 %s - 本次运行已登录过，最终重试不再重复登录，直接用现有凭证重试" % (
             account_index))
         sign_with_credentials(creds, account_index, result, only=need or None)
-        return result
+        return _finish_account(username, result, account_index)
 
     new_creds, error = login_for_credentials(username, password, account_index)
 
@@ -1297,7 +1425,7 @@ def sign_in_account(username, password, account_index, total_accounts,
             result['jindou_status'] = status
             result['jindou_message'] = status
         result['password_error'] = bool(error.get('password_error'))
-        return result
+        return _finish_account(username, result, account_index)
 
     set_cached_credentials(username, new_creds)
     login_done_accounts.add(username)
@@ -1308,7 +1436,7 @@ def sign_in_account(username, password, account_index, total_accounts,
     if still_expired:
         log("账号 %s - 新凭证仍无法通过校验: %s" % (
             account_index, '、'.join(still_expired)))
-    return result
+    return _finish_account(username, result, account_index)
 
 
 def _merge_results(best, new):
@@ -1342,6 +1470,11 @@ def _merge_results(best, new):
     merged['retry_count'] = new.get('retry_count', merged.get('retry_count', 0))
     merged['is_final_retry'] = new.get('is_final_retry', merged.get('is_final_retry', False))
     merged['password_error'] = new.get('password_error', merged.get('password_error', False))
+    # 今日已跳过 / 本次产生过新记录：任一次命中就保留，避免合并后丢失
+    merged['skipped_today'] = bool(best.get('skipped_today') or new.get('skipped_today'))
+    merged['signed_now'] = bool(best.get('signed_now') or new.get('signed_now'))
+    if not merged.get('last_sign_at'):
+        merged['last_sign_at'] = new.get('last_sign_at') or ''
     return merged
 
 
@@ -1553,11 +1686,20 @@ def _beans_text(result):
 
 
 def _account_line(account, result):
-    """返回 (类别, 一行描述)；类别为 ok / already / failed"""
+    """返回 (类别, 一行描述)；类别为 ok / already / skipped / failed"""
     if result.get('password_error'):
         return 'failed', "❌ 账号({})：账号或密码错误".format(account)
 
     body = "{}；{}".format(_points_text(result), _beans_text(result))
+
+    if result.get('skipped_today'):
+        done_at = result.get('last_sign_at') or ''
+        clock = done_at.split(' ')[-1][:5] if ' ' in done_at else ''
+        balance = "积分 {}；金豆 {}".format(
+            _fmt_reward(result.get('final_points') or 0),
+            _fmt_reward(result.get('final_jindou') or 0))
+        return 'skipped', "⏭️ 账号({})：今日已完成{}，{}".format(
+            account, "（{}）".format(clock) if clock else '', balance)
 
     if not result.get('oshwhub_success') or not result.get('jindou_success'):
         return 'failed', "❌ 账号({})：{}".format(account, body)
@@ -1575,12 +1717,13 @@ def _build_serverchan3_desp(group_results, usernames):
         签到统计
         成功：4
         已签到：0
+        跳过：0
         失败：0
         【签到成功】
         ✅ 账号(123****78A)：积分 +5（140→145）；金豆 +2（8→10）
         ...
     """
-    ok = already = failed = 0
+    ok = already = skipped = failed = 0
     details = []
 
     for result in group_results:
@@ -1594,6 +1737,8 @@ def _build_serverchan3_desp(group_results, usernames):
             ok += 1
         elif kind == 'already':
             already += 1
+        elif kind == 'skipped':
+            skipped += 1
         else:
             failed += 1
         details.append(line)
@@ -1602,6 +1747,7 @@ def _build_serverchan3_desp(group_results, usernames):
         "签到统计",
         "成功：{}".format(ok),
         "已签到：{}".format(already),
+        "跳过：{}".format(skipped),
         "失败：{}".format(failed),
         "【签到成功】" if failed == 0 else "【签到失败】",
     ]
@@ -1609,8 +1755,13 @@ def _build_serverchan3_desp(group_results, usernames):
     return "\n\n".join(lines), failed
 
 
-def push_serverchan3(all_results, total_accounts, usernames=None):
+def push_serverchan3(all_results, total_accounts, usernames=None, should_push=True):
     """按 sendkey 分组推送；同一个 sendkey 的账号合并成一条消息"""
+    # 所有账号都是「今天已完成，跳过」且没有失败时，没有任何新信息，不打扰用户
+    if not should_push:
+        log("Server酱3-本次没有新增签到成功记录，跳过推送")
+        return
+
     mapping = parse_serverchan3_keys(total_accounts)
     if not mapping:
         log("Server酱3-未配置 SERVERCHAN3_SCKEY，跳过推送")
@@ -1662,7 +1813,7 @@ def push_serverchan3(all_results, total_accounts, usernames=None):
             log("Server酱3-推送异常（{}）: {}".format(_mask_key(key), e))
 
 
-def push_summary(all_results=None, total_accounts=0, usernames=None):
+def push_summary(all_results=None, total_accounts=0, usernames=None, should_push=True):
     if not summary_logs:
         return
     
@@ -1739,7 +1890,7 @@ def push_summary(all_results=None, total_accounts=0, usernames=None):
 
     # Server酱3（同一 sendkey 的账号合并为一条推送）
     if all_results is not None:
-        push_serverchan3(all_results, total_accounts, usernames)
+        push_serverchan3(all_results, total_accounts, usernames, should_push)
 
     # 酷推 (CoolPush)
     coolpush_skey = os.getenv('COOLPUSH_SKEY')
@@ -1818,6 +1969,16 @@ def main():
     
     if has_failed_accounts:
         all_results = execute_final_retry_for_failed_accounts(all_results, usernames, passwords, total_accounts)
+
+    # 补记：只有部分重试后才两边都成功的账号，也要写「今日已完成」记录，
+    # 否则下次运行还会再去请求一遍接口
+    for result in all_results:
+        if (result.get('oshwhub_success') and result.get('jindou_success')
+                and not result.get('skipped_today') and not result.get('signed_now')):
+            idx = result['account_index']
+            if 0 < idx <= len(usernames):
+                record_sign_success(usernames[idx - 1], result, idx)
+                result['signed_now'] = True
     
     # 总结：一行一个账号，只打印必要信息
     log("=" * 62)
@@ -1829,6 +1990,8 @@ def main():
     total_jindou_reward = 0
     failed_accounts = []
     password_error_accounts = []
+    skipped_accounts = []
+    new_success_count = 0
 
     def _masked(index):
         if 0 < index <= len(usernames):
@@ -1844,6 +2007,20 @@ def main():
             password_error_accounts.append(index)
             log("  ❌ 账号(%s)：账号或密码错误" % account)
             continue
+
+        if result.get('skipped_today'):
+            # 东八区今天已经全部签完，本次不发请求也不推送：只记一行
+            skipped_accounts.append(index)
+            done_at = result.get('last_sign_at') or ''
+            clock = done_at.split(' ')[-1][:5] if ' ' in done_at else ''
+            log("  ⏭️ 账号(%s)：今日已完成%s，积分 %s、金豆 %s" % (
+                account, "（%s）" % clock if clock else '',
+                _fmt_reward(result.get('final_points') or 0),
+                _fmt_reward(result.get('final_jindou') or 0)))
+            continue
+
+        if result.get('signed_now'):
+            new_success_count += 1
 
         if result['oshwhub_success']:
             oshwhub_success_count += 1
@@ -1869,9 +2046,16 @@ def main():
         jindou_success_count, total_accounts,
         _fmt_reward(total_points_reward), _fmt_reward(total_jindou_reward)))
 
+    if skipped_accounts:
+        log("跳过 %d 个账号（东八区今日已完成）：%s" % (
+            len(skipped_accounts),
+            "、".join(_masked(i) for i in sorted(skipped_accounts))))
+
     all_failed_accounts = failed_accounts + password_error_accounts
     if all_failed_accounts:
         log("失败账号：%s" % "、".join(_masked(i) for i in sorted(all_failed_accounts)))
+    elif skipped_accounts and len(skipped_accounts) == total_accounts:
+        log("全部账号今日已完成，本次没有发起签到")
     else:
         log("全部账号签到成功")
     log("=" * 62)
@@ -1881,10 +2065,14 @@ def main():
         save_credential_cache(usernames)
     except Exception as e:
         log(f"凭证回写失败: {e}")
-    
+
+    # 只有真的产生了新的签到成功记录才推 Server酱3，全部跳过时不打扰；
+    # 但只要有失败，仍然要推（失败比「避免重复」更重要）
+    should_push = new_success_count > 0 or bool(all_failed_accounts)
+
     # 推送总结（Server酱3 按 sendkey 合并同一批账号）
     try:
-        push_summary(all_results, total_accounts, usernames)
+        push_summary(all_results, total_accounts, usernames, should_push)
     except Exception as e:
         log(f"推送总结时出现异常: {e}")
     
