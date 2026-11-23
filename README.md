@@ -181,48 +181,101 @@ SERVERCHAN3_SCKEY=sctp111tAAA,sctp222tBBB
 
 ---
 
-### 本地部署说明
+### 本地运行与调试（推荐先在本地验证）
 
-如果你希望在本地环境运行此脚本，可以按照以下步骤进行配置：
+#### 1. 准备环境
 
-环境要求
-
-· Python 3.7 或更高版本
-
-· Chrome 浏览器
-
-· ChromeDriver（与Chrome版本匹配）
-
-安装步骤
-
-1. 克隆项目到本地
+需要 Python 3.7+ 和 Chrome（没有 Chrome 会自动改用 Edge）。
 
 ```bash
-git clone https://github.com/zhangMonday/jlc-auto-sign.git
+git clone <你的仓库地址>
 cd jlc-auto-sign
+python -m venv .venv
+.venv/Scripts/activate           # macOS / Linux: source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-2. 安装Python依赖
+selenium 4 会自己下载并匹配浏览器驱动，不用手动装 chromedriver。
+
+#### 2. 先跑自测（不需要真实账号）
 
 ```bash
-pip install selenium requests
+# 只验证「签到页 -> 登录页」这一段，最快（约 10 秒）
+.venv/Scripts/python.exe test_captcha.py --fake --only-entry
+
+# 验证完整链路：进登录页 -> 填假账号 -> 过滑块（最后提示"密码不正确"属正常）
+.venv/Scripts/python.exe test_captcha.py --fake
+
+# 想肉眼看浏览器操作过程
+.venv/Scripts/python.exe test_captcha.py --fake --headful
+
+# 用真实账号完整跑一遍（不写进命令行，避免留在历史记录里）
+#   PowerShell:  $env:JLC_USERNAME="你的账号"; $env:JLC_PASSWORD="你的密码"
+#   cmd:         set JLC_USERNAME=你的账号 & set JLC_PASSWORD=你的密码
+.venv/Scripts/python.exe test_captcha.py
 ```
 
-3. 安装ChromeDriver
-   · 访问[ChromeDriver](https://developer.chrome.com/docs/chromedriver/downloads)下载页面
-   · 下载与你的Chrome版本匹配的ChromeDriver
-   
-   · 将ChromeDriver添加到系统PATH中：
-   
-     · Windows: 解压到 C:\Windows\system32\
-   
-     · Linux/macOS: 解压到 /usr/local/bin/
+每一步的截图会存到 `debug/`（已被 `.gitignore` 忽略），出问题直接看 `01_login_entry.png`、`03_captcha.png`、`04_after_solve.png`。
 
-5. 运行脚本
+#### 3. 运行主脚本
 
 ```bash
-python jlc.py 账号1,账号2,账号3... 密码1,密码2,密码3...
+# 参数方式
+python jlc.py 账号1,账号2 密码1,密码2 [失败退出标志]
+
+# 环境变量方式（推荐本地调试，密码不落在命令历史里）
+python jlc.py            # 自动读 JLC_USERNAME / JLC_PASSWORD
 ```
+
+#### 4. 环境变量一览
+
+| 变量 | 作用 | 示例 |
+| --- | --- | --- |
+| `JLC_USERNAME` | 账号，多个用逗号分隔 | `13800138000,abc@qq.com` |
+| `JLC_PASSWORD` | 密码，与账号一一对应 | `pwd1,pwd2` |
+| `JLC_BROWSER` | 浏览器，`chrome` 或 `edge` | `edge` |
+| `JLC_HEADLESS` | 设为 `0` 显示浏览器窗口（默认无头） | `0` |
+| `JLC_FAIL_EXIT` | 设为 `true` 时任意账号失败返回非零退出码 | `true` |
+| `SERVERCHAN3_SCKEY` | Server酱3 推送 key，多个用逗号分隔 | `sctp111tAAA` |
+
+注意：`JLC_HEADLESS=0` 表示「显示窗口」，没有 `JLC_HEADFUL` 这个变量。
+
+注入方式（Windows）：
+
+PowerShell（只对当前窗口有效）：
+
+```powershell
+$env:JLC_BROWSER = "edge"
+$env:JLC_HEADLESS = "0"
+$env:JLC_USERNAME = "13800138000"
+$env:JLC_PASSWORD = "你的密码"
+.\venv\Scripts\python.exe jlc.py
+```
+
+cmd：
+
+```bat
+set JLC_BROWSER=edge
+set JLC_HEADLESS=0
+set JLC_USERNAME=13800138000
+set JLC_PASSWORD=你的密码
+.venv\Scripts\python.exe jlc.py
+```
+
+Git Bash / macOS / Linux（只对本次命令有效）：
+
+```bash
+JLC_BROWSER=edge JLC_HEADLESS=0 JLC_USERNAME=13800138000 JLC_PASSWORD=你的密码 \
+  .venv/Scripts/python.exe jlc.py
+```
+
+清除：PowerShell 用 `Remove-Item Env:JLC_BROWSER`，cmd 用 `set JLC_BROWSER=`。
+
+#### 5. 常见问题
+
+- **卡在「页面未自动跳转」**：签到页里拿不到可见的登录链接，通常是网络慢、页面还没渲染完。脚本会等 12 秒，再退到默认的 passport 登录地址；仍然失败时会打印当前 URL，配合 `debug/` 截图排查。
+- **滑块一直「验证失败」**：先确认 `stealth.py` 注入成功（`window.cdc_*` 标记已抹掉），并检查是否误加了 `--blink-settings=imagesEnabled=false`（会让滑块背景图不渲染、尺寸变 0）。
+- **想看错误现场**：加 `JLC_HEADLESS=0`，或给 `test_captcha.py` 加 `--keep`，浏览器不会自动关，可以直接在窗口里操作。
 
 ---
 
