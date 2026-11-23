@@ -1025,6 +1025,7 @@ def _empty_account_result(account_index, retry_count=0, is_final_retry=False):
         'oshwhub_status': '未知',
         'oshwhub_success': False,
         'oshwhub_message': '',
+        'oshwhub_non_retryable': False,
         'initial_points': 0,
         'final_points': 0,
         'points_reward': 0,
@@ -1192,6 +1193,8 @@ def _apply_points_result(result, res):
     result['final_points'] = res.get('final_points') or 0
     result['points_reward'] = res.get('points_reward') or 0
     result['gifts'] = res.get('gifts') or []
+    # 账号条件不满足（签到接口明确拒绝）→ 重试没有意义
+    result['oshwhub_non_retryable'] = bool(res.get('non_retryable'))
     if res.get('nickname'):
         result['nickname'] = format_nickname(res['nickname'])
     if res.get('customer_code'):
@@ -1250,6 +1253,9 @@ def sign_with_credentials(creds, account_index, result, only=None):
                         account_index, result['oshwhub_status'],
                         result['initial_points'], result['final_points'],
                         result['points_reward']))
+                    if not result['oshwhub_success'] and result.get('oshwhub_message'):
+                        log("账号 %s - 积分未成功: %s" % (
+                            account_index, result['oshwhub_message']))
                     done = True
                     break
                 except AuthExpired as e:
@@ -1470,6 +1476,11 @@ def _merge_results(best, new):
     merged['retry_count'] = new.get('retry_count', merged.get('retry_count', 0))
     merged['is_final_retry'] = new.get('is_final_retry', merged.get('is_final_retry', False))
     merged['password_error'] = new.get('password_error', merged.get('password_error', False))
+    if new.get('oshwhub_success'):
+        merged['oshwhub_non_retryable'] = False
+    else:
+        merged['oshwhub_non_retryable'] = bool(
+            merged.get('oshwhub_non_retryable') or new.get('oshwhub_non_retryable'))
     # 今日已跳过 / 本次产生过新记录：任一次命中就保留，避免合并后丢失
     merged['skipped_today'] = bool(best.get('skipped_today') or new.get('skipped_today'))
     merged['signed_now'] = bool(best.get('signed_now') or new.get('signed_now'))
@@ -1504,10 +1515,16 @@ def process_single_account(username, password, account_index, total_accounts):
 
 
 def execute_final_retry_for_failed_accounts(all_results, usernames, passwords, total_accounts):
-    """对仍然失败的账号做最后一次重试（排除密码错误）"""
-    failed = [r for r in all_results
-              if (not r['oshwhub_success'] or not r['jindou_success'])
-              and not r.get('password_error', False)]
+    """对仍然失败的账号做最后一次重试（排除密码错误、账号条件不满足的）"""
+    failed = []
+    for r in all_results:
+        if r.get('password_error'):
+            continue
+        # 积分那种「接口明确拒绝、重试也没用」的失败不算需要重试，否则只会再撞一次限流
+        points_bad = (not r['oshwhub_success']) and not r.get('oshwhub_non_retryable')
+        beans_bad = not r['jindou_success']
+        if points_bad or beans_bad:
+            failed.append(r)
 
     if not failed:
         log("没有需要最终重试的账号")

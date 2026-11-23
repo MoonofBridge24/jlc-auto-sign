@@ -28,3 +28,5 @@ desktop.ini
 
 # ---- WorkBuddy 项目数据 ----
 .workbuddy/
+_tmp_*.py
+_tmp_*.json

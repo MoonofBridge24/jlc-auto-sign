@@ -298,11 +298,23 @@ class OshwhubClient(_BaseClient):
                 value = None
         return default if value is None else value
 
+    def _sign_block_reasons(self, profile, user):
+        """
+        签到接口返回 false 时的可能原因，给用户可操作的方向。
+        开源平台要求账号先设置昵称（系统自动生成的 eda_xxx 不算）。
+        """
+        reasons = []
+        if str((user or {}).get("nickname") or "").startswith("eda_"):
+            reasons.append("未设置昵称")
+        if _to_number((profile or {}).get("userProjectCount")) == 0:
+            reasons.append("还没有开源项目")
+        return reasons or ["账号状态不满足签到条件"]
+
     def run(self):
         """
         积分签到完整流程，返回：
         {
-          'status': '签到成功' / '已签到过' / '签到失败',
+          'status': '签到成功' / '已签到过' / '签到未生效' / '签到失败',
           'success': bool,          # 是否算签到完成（含已签到）
           'initial_points': int,
           'final_points': int,
@@ -329,9 +341,48 @@ class OshwhubClient(_BaseClient):
                 "/".join(sorted(profile)[:10]) or "空"))
 
         status = "已签到过"
-        if not already and self.sign_in():
-            status = "签到成功"
-        # sign_in() 返回 False：今天其实已经签过了（并发/前端状态滞后），按已签到处理
+        message = "今天已签到过"
+        if not already:
+            if self.sign_in():
+                status = "签到成功"
+                message = "签到成功"
+            else:
+                # result=false 有两种可能：并发下今天其实已经签过，或签到被服务端拒绝。
+                # 必须复核 profile——仍显示未签到就是真失败，绝不能当成「已签到过」
+                # （之前就是这样把失败报成已签到，用户看到的是「已签到过，积分 0 → 0」）。
+                try:
+                    check = self.get_sign_profile()
+                except (ApiError, AuthExpired):
+                    check = None
+
+                if check is not None and check.get("isTodaySignIn"):
+                    status = "已签到过"
+                    message = "今天已签到过（签到接口返回 false，复核已签到）"
+                else:
+                    view = check or profile
+                    reasons = self._sign_block_reasons(view, user)
+                    status = "签到未生效"
+                    message = "签到接口返回 false，疑似%s" % "、".join(reasons)
+                    self.log(
+                        "积分: 签到未生效 —— result=false；isTodaySignIn=%s，周签到=%s，月签到=%s，"
+                        "项目数=%s，昵称系统自动生成=%s" % (
+                            view.get("isTodaySignIn"), view.get("week_signIn_days"),
+                            view.get("month_signIn_days"), view.get("userProjectCount"),
+                            "是" if str(nickname).startswith("eda_") else "否"))
+                    return {
+                        "status": status,
+                        "success": False,
+                        # 账号条件不满足，重试和重登都没意义，只会再撞一次限流
+                        "non_retryable": True,
+                        "initial_points": initial,
+                        "final_points": initial,
+                        "points_reward": 0,
+                        "nickname": nickname,
+                        "customer_code": customer_code,
+                        "gifts": [],
+                        "message": message,
+                    }
+        # sign_in() 返回 false 但复核发现已签到：按已签到处理
 
         # 好礼：签到后再读一次签到信息，拿最新的连续签到天数和领取状态
         gifts = []
@@ -365,7 +416,7 @@ class OshwhubClient(_BaseClient):
             "nickname": nickname,
             "customer_code": customer_code,
             "gifts": gifts,
-            "message": "签到成功" if status == "签到成功" else "今天已签到过",
+            "message": message,
         }
 
 
