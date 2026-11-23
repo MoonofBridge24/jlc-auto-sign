@@ -4,6 +4,7 @@ import sys
 import time
 import json
 import tempfile
+import shutil
 import random
 import requests
 import selenium
@@ -36,6 +37,9 @@ SELENIUM_MAJOR = int(str(getattr(selenium, "__version__", "4")).split(".")[0])
 
 # 浏览器真实 UA（无头模式被 CDP 覆盖后的值），供 requests 侧统一使用
 BROWSER_UA = ""
+
+# 本次浏览器用的临时 profile 目录（退出后删掉，不在本地留 Cookie）
+PROFILE_DIR = ""
 
 # 全局变量用于收集总结日志
 in_summary = False
@@ -161,14 +165,20 @@ def switch_ua(driver, ua, mobile=False):
         "platform": "iPhone" if mobile else "Win32",
         "userAgentMetadata": _ua_metadata(ua, mobile),
     }
+    # 老版本 Chrome 的 Network.setUserAgentOverride 不认 userAgentMetadata，
+    # 所以每个命令都先带 metadata 试一次，失败再去掉 metadata 试一次。
+    variants = [params, {k: v for k, v in params.items() if k != "userAgentMetadata"}]
     switched = False
     for cmd in ("Emulation.setUserAgentOverride", "Network.setUserAgentOverride"):
-        try:
-            driver.execute_cdp_cmd(cmd, params)
-            switched = True
+        for variant in variants:
+            try:
+                driver.execute_cdp_cmd(cmd, variant)
+                switched = True
+                break
+            except Exception:
+                continue
+        if switched:
             break
-        except Exception:
-            continue
     if not switched:
         return False
 
@@ -296,7 +306,11 @@ def create_driver():
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--user-data-dir=%s" % tempfile.mkdtemp())
+    global PROFILE_DIR
+    # 上一次如果没走到 quit（异常重启），先把旧 profile 删掉
+    cleanup_profile_dir()
+    PROFILE_DIR = tempfile.mkdtemp()
+    opts.add_argument("--user-data-dir=%s" % PROFILE_DIR)
     opts.add_argument("--lang=zh-CN")
     opts.add_argument("--disable-blink-features=AutomationControlled")
     # selenium 3.141 的 Edge Options 没有 add_experimental_option，这里做兼容
@@ -345,6 +359,16 @@ def create_driver():
             "建议使用 Chrome（JLC_BROWSER=chrome）并搭配 selenium 4")
 
     return driver
+
+def cleanup_profile_dir():
+    """删掉本次浏览器用的临时 profile：里面存着 Cookie / localStorage，不留在本机"""
+    global PROFILE_DIR
+    if not PROFILE_DIR:
+        return
+    path = PROFILE_DIR
+    PROFILE_DIR = ""
+    shutil.rmtree(path, ignore_errors=True)
+
 
 def format_nickname(nickname):
     """格式化昵称，只显示第一个字和最后一个字，中间用星号代替"""
@@ -518,6 +542,21 @@ def _local_storage_tokens(driver):
     return tokens
 
 
+def _looks_like_token(value):
+    """
+    判断是不是真的 access token。
+
+    m.jlc.com 未登录时，请求头里同样会有 X-JLC-AccessToken，值是字符串 "null"
+    （以前就是把这个 "null" 当 token 存下来，签到必然 401）。
+    """
+    if not value:
+        return False
+    text = str(value).strip()
+    if text.lower() in ('null', 'none', 'undefined', 'false', '0', '""'):
+        return False
+    return len(text) >= 16
+
+
 def _read_token_from_local_storage(driver):
     """从 localStorage 读 X-JLC-AccessToken（各站点 key 大小写略有差异）"""
     for key in ("X-JLC-AccessToken", "x-jlc-accesstoken", "accessToken", "token"):
@@ -549,7 +588,7 @@ def _read_token_from_performance(driver):
             headers = (message.get("params") or {}).get("request", {}).get("headers") or {}
             for key in ("x-jlc-accesstoken", "X-JLC-AccessToken", "x-jlc-AccessToken"):
                 token = headers.get(key)
-                if token:
+                if _looks_like_token(token):
                     log("从请求头取到 access token: %s" % _mask_secret(token))
                     return token
         except Exception:
@@ -557,51 +596,108 @@ def _read_token_from_performance(driver):
     return None
 
 
+MOBILE_LOGIN_URL = (
+    "https://passport.jlc.com/m/login?appId=JLC_MOBILE_APP"
+    "&redirectUrl=https%3A%2F%2Fm.jlc.com%2Fpages%2Fmy%2Findex%23%2Ffrom%3Djlc_cas"
+    "&wxAuthProxy=https%3A%2F%2Fm.jlc.com%2Fpages-common%2Fwechat%2Fweb-page-auth-proxy"
+)
+
+
+def _wait_mobile_token(driver, timeout=10.0):
+    """在 m.jlc.com 页面上轮询 access token（localStorage 优先，其次请求头）"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        token = _read_token_from_local_storage(driver) or _read_token_from_performance(driver)
+        if _looks_like_token(token):
+            return token
+        time.sleep(1)
+    return ""
+
+
+def _check_mobile_token(driver, token, account_index):
+    """用 token 调一次资产接口，确认真的能用（避免把 "null" 当 token 存进 secret）"""
+    res = inpage_fetch(
+        driver,
+        "https://m.jlc.com/api/appPlatform/center/assets/selectPersonalAssetsInfo",
+        headers={"x-jlc-accesstoken": token, "x-jlc-clienttype": "WEB"},
+        timeout=10)
+    status = res.get("status")
+    ok = (status == 200
+          and '"success":true' in (res.get("body") or "").replace(" ", "").lower())
+    log("账号 %s - token 校验: HTTP %s%s" % (
+        account_index, status or "无响应", "，接口可用" if ok else "，不可用"))
+    return ok
+
+
 def fetch_mobile_token(driver, account_index, desktop_ua, timeout=12.0):
     """
     切移动端 UA 进 m.jlc.com 取 X-JLC-AccessToken。
 
-    桌面 UA 访问 m.jlc.com 会被强制重定向到 www.jlc.com（PC 站），
-    PC 站前端不落 token，所以无论如何翻 localStorage / 请求头都拿不到。
+    两个前提：
+    - 桌面 UA 访问 m.jlc.com 会被 302 到 www.jlc.com（PC 站），PC 站不落 token；
+    - 光有 oshwhub 的登录态不够：m.jlc.com 是另一个 appId（JLC_MOBILE_APP），
+      必须走一次移动端 CAS——passport 有会话时会静默放行，不用再输密码——
+      页面拿到用户信息后才会把 token 写进 localStorage。
     """
     log("账号 %s - 切换移动端 UA 访问 m.jlc.com 获取 access token" % account_index)
     if not switch_ua(driver, MOBILE_UA, mobile=True):
         log("账号 %s - 切换移动端 UA 失败（驱动不支持 CDP 覆盖 UA）" % account_index)
+    try:
+        now_ua = driver.execute_script("return navigator.userAgent;") or ""
+        log("账号 %s - 当前 UA: %s" % (
+            account_index, "移动端 ✓" if ("iPhone" in now_ua or "Mobile" in now_ua)
+            else now_ua[:70]))
+    except Exception:
+        pass
 
     token = ""
-    for url in ("https://m.jlc.com/", "https://m.jlc.com/mapp/pages/my/index"):
+
+    # 1. 先直接进「我的」页，个别账号 SSO 已经生效
+    try:
+        driver.get("https://m.jlc.com/pages/my/index")
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body")))
+        token = _wait_mobile_token(driver, timeout=8)
+    except Exception as e:
+        log("账号 %s - 打开 m.jlc.com「我的」页失败: %s" % (
+            account_index, str(e).splitlines()[0][:120]))
+
+    # 2. 没有 token 就走移动端 CAS 登录页
+    if not token:
+        log("账号 %s - 未取到 token，走移动端 CAS（appId=JLC_MOBILE_APP）" % account_index)
         try:
-            driver.get(url)
+            driver.get(MOBILE_LOGIN_URL)
+            WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body")))
+            time.sleep(1.5)
+            if ("passport.jlc.com" in (driver.current_url or "")
+                    and "login" in (driver.current_url or "")):
+                log("账号 %s - 移动端仍停在 passport 登录页，说明 SSO 会话没带过去" % account_index)
+            token = _wait_mobile_token(driver, timeout=timeout)
+        except Exception as e:
+            log("账号 %s - 打开移动端登录页失败: %s" % (
+                account_index, str(e).splitlines()[0][:120]))
+
+    # 3. 校验，别把 "null" 这种假 token 存下来（以前就是这么 401 的）
+    if token and not _check_mobile_token(driver, token, account_index):
+        token = ""
+
+    # 4. 兜底：CAS 回来后页面可能还没落 token，重进一次「我的」页再等一轮
+    if not token:
+        try:
+            driver.get("https://m.jlc.com/pages/my/index")
             WebDriverWait(driver, 15).until(
                 EC.presence_of_element_located((By.TAG_NAME, "body")))
+            token = _wait_mobile_token(driver, timeout=8)
+            if token and not _check_mobile_token(driver, token, account_index):
+                token = ""
         except Exception as e:
-            log("账号 %s - 打开 %s 失败: %s" % (
-                account_index, url, str(e).splitlines()[0][:120]))
-            continue
+            log("账号 %s - 重进「我的」页失败: %s" % (
+                account_index, str(e).splitlines()[0][:120]))
 
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            token = (_read_token_from_local_storage(driver)
-                     or _read_token_from_performance(driver))
-            if token:
-                break
-            time.sleep(1)
-
-        if token:
-            break
-        log("账号 %s - %s 未取到 token，当前地址: %s" % (
-            account_index, url, driver.current_url))
-
-    if token:
-        check = inpage_fetch(
-            driver,
-            "https://m.jlc.com/api/appPlatform/center/assets/selectPersonalAssetsInfo",
-            headers={"x-jlc-accesstoken": token, "x-jlc-clienttype": "WEB"},
-            timeout=10)
-        body = (check.get("body") or "")
-        log("账号 %s - token 校验: HTTP %s%s" % (
-            account_index, check.get("status") or "无响应",
-            "，接口可用" if '"success":true' in body.replace(" ", "") else ""))
+    if not token:
+        log("账号 %s - 仍未拿到可用 access token，当前地址: %s" % (
+            account_index, driver.current_url))
 
     # 切回桌面端 UA，避免影响后续页面状态
     if desktop_ua:
@@ -638,6 +734,9 @@ def extract_credentials_from_browser(driver, account_index):
 
     desktop_ua = _current_ua(driver)
     token = _read_token_from_local_storage(driver) or _read_token_from_performance(driver)
+    if not _looks_like_token(token):
+        # 开源平台页面上不会有金豆 token，拿到的多是空值或 "null"，直接走移动端取
+        token = ""
     if not token:
         token = fetch_mobile_token(driver, account_index, desktop_ua)
 
@@ -645,6 +744,8 @@ def extract_credentials_from_browser(driver, account_index):
         # 个别环境把 token 放在 Cookie 里
         for name, value in cookies.items():
             if name.lower().replace("-", "") in ("xjlcaccesstoken", "jlcaccesstoken"):
+                if not _looks_like_token(value):
+                    continue
                 token = value
                 log("从 Cookie(%s) 取到 access token: %s" % (name, _mask_secret(value)))
                 break
@@ -967,6 +1068,8 @@ def login_for_credentials(username, password, account_index):
                 log("账号 %s - 浏览器已关闭（凭证已取走，后续走接口）" % account_index)
             except Exception:
                 pass
+            # 干净的浏览器：profile（Cookie / localStorage）用完就删
+            cleanup_profile_dir()
 
 
 def _apply_points_result(result, res):
