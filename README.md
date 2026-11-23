@@ -48,6 +48,7 @@ Github Actions 单次任务执行时长限制在 6 小时以内，即使每个�
 | --- | --- | --- |
 | 登录 | Selenium + 阿里云滑块 | 账号密码 |
 | 开源平台积分签到 | `GET/POST https://oshwhub.com/api/users*` | Cookie（整串，关键 `oshwhub_session`） |
+| 开源平台签到好礼 | `https://oshwhub.com/api/gift/goodGift[/{uuid}]` | 同上 |
 | 嘉立创金豆签到 | `https://m.jlc.com/api/activity/sign/*` | 请求头 `X-JLC-AccessToken` |
 
 这样即使无头浏览器被风控、或者 Actions 上启动浏览器很慢，只要凭证还有效，签到本身几乎不受影响。
@@ -72,8 +73,22 @@ Github Actions 单次任务执行时长限制在 6 小时以内，即使每个�
    `jlc_customer_code` 等多个 Cookie 里，只留名字带 `session` 的会缺信息。请求时优先发浏览器
    原样的 Cookie 头，被拒再退回「只用会话 Cookie」重试一次（缓存里的 WAF Cookie 可能属于旧 IP）。
 
-> 开源平台的「7天好礼 / 月度好礼」按钮在页面上是前端弹窗，没有稳定的公开接口，目前不再自动点击；
-> 金豆侧的第七天奖励仍会在签到后自动调用 `receiveVoucher` 领取。
+### 签到好礼自动领取
+
+开源平台的「七日好礼 / 月度好礼」是签到页里的弹窗，但底层有接口，脚本会自己领：
+
+- 领取条件（与页面按钮一致，代码在 `jlc_api.OshwhubClient.claim_good_gifts`）：
+  - 七日好礼：`week_signInDays >= 7` 且 `goodGiftStatus.sevenGoodGiftRecord == 0`
+  - 月度好礼：`month_signInDays >= 当月天数` 且 `goodGiftStatus.monthGoodGiftRecord == 0`
+- 接口：`GET /api/gift/goodGift` 取可领礼包（`sevenDays` / `monthEnd` 各自的 `uuid`），
+  `GET /api/gift/goodGift/{uuid}` 领取；返回 `1` = 优惠券、`2` = 积分、`0` = 领取失败。
+- 已经领过（`...Record == 1`）或天数不够时**不发请求**，只在条件满足时领一次；
+  领取失败只提示、不算签到失败（签到本身仍成功）。
+- 好消息：现在七日好礼多是**优惠券**（如 30 元 PCB 打样券），领到后到「个人中心 → 优惠券中心」查看；
+  月度好礼是 20 元器件券。若某期改成送积分，积分会体现在当次 `积分 +N` 的增量里。
+- 金豆侧的第七天奖励仍由 `receiveVoucher` 自动领取。
+
+推送里会带上 `含七日好礼` / `含七日好礼（优惠券）`，失败时是 `七日好礼领取失败（原因）`。
 
 
 ---

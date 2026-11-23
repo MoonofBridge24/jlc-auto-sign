@@ -956,6 +956,7 @@ def _empty_account_result(account_index, retry_count=0, is_final_retry=False):
         'final_jindou': 0,
         'jindou_reward': 0,
         'has_jindou_reward': False,
+        'gifts': [],
         'retry_count': retry_count,
         'is_final_retry': is_final_retry,
         'password_error': False,
@@ -1106,6 +1107,7 @@ def _apply_points_result(result, res):
     result['initial_points'] = res.get('initial_points') or 0
     result['final_points'] = res.get('final_points') or 0
     result['points_reward'] = res.get('points_reward') or 0
+    result['gifts'] = res.get('gifts') or []
     if res.get('nickname'):
         result['nickname'] = format_nickname(res['nickname'])
     if res.get('customer_code'):
@@ -1315,7 +1317,7 @@ def _merge_results(best, new):
 
     if new.get('oshwhub_success') and not merged.get('oshwhub_success'):
         for key in ('oshwhub_success', 'oshwhub_status', 'oshwhub_message',
-                    'initial_points', 'final_points', 'points_reward'):
+                    'initial_points', 'final_points', 'points_reward', 'gifts'):
             merged[key] = new.get(key)
     if new.get('jindou_success') and not merged.get('jindou_success'):
         for key in ('jindou_success', 'jindou_status', 'jindou_message',
@@ -1333,6 +1335,9 @@ def _merge_results(best, new):
     for key in ('nickname', 'customer_code', 'credential_source'):
         if merged.get(key) in (None, '', '未知') and new.get(key) not in (None, '', '未知'):
             merged[key] = new.get(key)
+
+    if not merged.get('gifts') and new.get('gifts'):
+        merged['gifts'] = new.get('gifts')
 
     merged['retry_count'] = new.get('retry_count', merged.get('retry_count', 0))
     merged['is_final_retry'] = new.get('is_final_retry', merged.get('is_final_retry', False))
@@ -1488,6 +1493,23 @@ def _short_reason(text, limit=40):
     return text[:limit] + ('…' if len(text) > limit else '')
 
 
+def _gift_note(result):
+    """好礼领取结果 → 一句后缀（没领到也没失败时返回空串）"""
+    notes = []
+    for gift in result.get('gifts') or []:
+        name = gift.get('name') or '好礼'
+        status = gift.get('status')
+        if status == 'ok':
+            detail = gift.get('message') or ''
+            notes.append("含{}{}".format(name, "（优惠券）" if "优惠券" in detail else ""))
+        elif status == 'fail':
+            notes.append("{}领取失败（{}）".format(
+                name, _short_reason(gift.get('message') or '未知原因')))
+    if not notes:
+        return ""
+    return "，" + "、".join(notes)
+
+
 def _points_text(result):
     """积分部分的一句话描述"""
     status = result.get('oshwhub_status') or '未知'
@@ -1496,12 +1518,19 @@ def _points_text(result):
     reward = result.get('points_reward') or 0
 
     if status == '签到成功':
-        return "积分 +{}（{}→{}）".format(
+        text = "积分 +{}（{}→{}）".format(
             _fmt_reward(reward), _fmt_reward(initial), _fmt_reward(final))
-    if status == '已签到过':
-        return "积分今日已签到（{}）".format(_fmt_reward(final))
-    return "积分签到失败（{}）".format(
-        _short_reason(result.get('oshwhub_message') or status))
+    elif status == '已签到过':
+        if reward:
+            # 已签到但积分变了，通常是补领的好礼到账
+            text = "积分今日已签到（{}→{}）".format(
+                _fmt_reward(initial), _fmt_reward(final))
+        else:
+            text = "积分今日已签到（{}）".format(_fmt_reward(final))
+    else:
+        return "积分签到失败（{}）".format(
+            _short_reason(result.get('oshwhub_message') or status))
+    return text + _gift_note(result)
 
 
 def _beans_text(result):

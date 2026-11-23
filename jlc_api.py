@@ -12,6 +12,8 @@
 - 嘉立创金豆：请求头 X-JLC-AccessToken（mobile 端 token，不含 Cookie 也能用）
 """
 
+import calendar
+import datetime
 import time
 
 import requests
@@ -179,6 +181,102 @@ class OshwhubClient(_BaseClient):
         result = self._api("POST", "/api/users/signIn")
         return bool(result)
 
+    # ---- 签到好礼（七日好礼 / 月度好礼）----
+
+    def gift_info(self):
+        """可领取的好礼：{sevenDays: {uuid, name}, monthEnd: {uuid, name}}"""
+        result = self._api("GET", "/api/gift/goodGift")
+        return result if isinstance(result, dict) else {}
+
+    def claim_good_gift(self, gift_uuid):
+        """
+        领取好礼，返回接口的 result 码：0=领取失败，1=优惠券，2=积分。
+        （前端「点击领取」走的就是这个 GET，见 _next 包里 /api/gift/goodGift/{uuid}）
+        """
+        result = self._api("GET", "/api/gift/goodGift/%s" % gift_uuid)
+        if isinstance(result, bool):
+            return 2 if result else 0
+        return _to_number(result)
+
+    # (key, 名称, goodGiftStatus 里的已领标记, 所需的连续签到天数来源)
+    GIFT_KINDS = (
+        ("seven", "七日好礼", "sevenGoodGiftRecord", "week_signIn_days"),
+        ("month", "月度好礼", "monthGoodGiftRecord", "month_signIn_days"),
+    )
+
+    def claim_good_gifts(self, profile=None):
+        """
+        自动领取签到好礼。
+
+        前端条件（packages/next 里的 signIn 组件）：
+        - 七日好礼：`week_signIn_days >= 7` 且 `goodGiftStatus.sevenGoodGiftRecord == 0`；
+        - 月度好礼：`month_signIn_days >= 当月天数` 且 `monthGoodGiftRecord == 0`。
+        这里按同一条件判断，真正能不能领仍由服务端决定。
+
+        返回 [{'name': '七日好礼', 'status': 'ok'/'fail', 'message': '领取积分'}]
+        """
+        if not isinstance(profile, dict):
+            try:
+                profile = self.get_sign_profile()
+            except AuthExpired:
+                raise
+            except ApiError as e:
+                self.log("好礼: 读取签到信息失败，跳过领取: %s" % e)
+                return []
+
+        gift_status = profile.get("goodGiftStatus") or {}
+        need_days = {"seven": 7, "month": _days_in_month()}
+
+        pending = []
+        for key, name, record_key, days_key in self.GIFT_KINDS:
+            if gift_status.get(record_key):
+                # 已经领过，不重复请求
+                continue
+            days = _to_number(profile.get(days_key))
+            if days < need_days[key]:
+                continue
+            pending.append((key, name))
+
+        if not pending:
+            return []
+
+        try:
+            info = self.gift_info()
+        except AuthExpired:
+            raise
+        except ApiError as e:
+            self.log("好礼: 获取可领取礼包失败: %s" % e)
+            return [{"name": name, "status": "fail", "message": str(e)}
+                    for _, name in pending]
+
+        gifts = []
+        for key, name in pending:
+            node = info.get("sevenDays" if key == "seven" else "monthEnd") or {}
+            uuid = node.get("uuid") or ""
+            if not uuid:
+                self.log("好礼: %s 当前没有可领取的礼包" % name)
+                continue
+            try:
+                code = self.claim_good_gift(uuid)
+            except AuthExpired:
+                raise
+            except ApiError as e:
+                gifts.append({"name": name, "status": "fail", "message": str(e)})
+                self.log("好礼: %s 领取失败: %s" % (name, e))
+                continue
+
+            if code == 2:
+                gifts.append({"name": name, "status": "ok", "message": "领取积分"})
+                self.log("好礼: %s 领取成功（积分）" % name)
+            elif code == 1:
+                gifts.append({"name": name, "status": "ok", "message": "领取优惠券"})
+                self.log("好礼: %s 领取成功（优惠券）" % name)
+            else:
+                gifts.append({"name": name, "status": "fail",
+                              "message": "接口返回 %s" % code})
+                self.log("好礼: %s 领取失败（接口返回 %s）" % (name, code))
+        return gifts
+
     # ---- 高层流程 ----
 
     def _points_now(self, default=0):
@@ -211,6 +309,7 @@ class OshwhubClient(_BaseClient):
           'points_reward': int,
           'nickname': str,
           'customer_code': str,
+          'gifts': [{'name', 'status', 'message'}],   # 签到好礼领取结果
           'message': str,
         }
         """
@@ -229,53 +328,44 @@ class OshwhubClient(_BaseClient):
                 "/".join(sorted(user)[:10]) or "空",
                 "/".join(sorted(profile)[:10]) or "空"))
 
-        if not already:
-            signed = self.sign_in()
+        status = "已签到过"
+        if not already and self.sign_in():
+            status = "签到成功"
+        # sign_in() 返回 False：今天其实已经签过了（并发/前端状态滞后），按已签到处理
 
-            if not signed:
-                # 接口返回 result=false：今天其实已经签过了（并发/前端状态滞后）
-                final = self._points_now(initial)
-                return {
-                    "status": "已签到过",
-                    "success": True,
-                    "initial_points": initial,
-                    "final_points": final,
-                    "points_reward": final - initial,
-                    "nickname": nickname,
-                    "customer_code": customer_code,
-                    "message": "今天已签到过",
-                }
+        # 好礼：签到后再读一次签到信息，拿最新的连续签到天数和领取状态
+        gifts = []
+        try:
+            fresh = self.get_sign_profile()
+        except AuthExpired:
+            raise
+        except ApiError as e:
+            fresh = None
+            self.log("好礼: 刷新签到信息失败，跳过领取: %s" % e)
+        if fresh is not None:
+            gifts = self.claim_good_gifts(fresh)
 
-            # 签到后积分可能有短暂延迟，最多再看两次
-            final = initial
-            for wait in (0, 1.5, 2.5):
-                if wait:
-                    time.sleep(wait)
-                final = self._points_now(initial)
-                if final != initial:
-                    break
-            return {
-                "status": "签到成功",
-                "success": True,
-                "initial_points": initial,
-                "final_points": final,
-                "points_reward": final - initial,
-                "nickname": nickname,
-                "customer_code": customer_code,
-                "message": "签到成功",
-            }
+        # 积分到账可能有延迟；领过好礼时多等一会儿
+        gift_claimed = any(g.get("status") == "ok" for g in gifts)
+        rounds = (0, 1.5, 2.5) if (status == "签到成功" or gift_claimed) else (0,)
+        final = initial
+        for wait in rounds:
+            if wait:
+                time.sleep(wait)
+            final = self._points_now(initial)
+            if final != initial:
+                break
 
-        # 已签到，只刷新一次积分
-        final = self._points_now(initial)
         return {
-            "status": "已签到过",
+            "status": status,
             "success": True,
             "initial_points": initial,
             "final_points": final,
             "points_reward": final - initial,
             "nickname": nickname,
             "customer_code": customer_code,
-            "message": "今天已签到过",
+            "gifts": gifts,
+            "message": "签到成功" if status == "签到成功" else "今天已签到过",
         }
 
 
@@ -422,6 +512,12 @@ class JlcBeanClient(_BaseClient):
             "customer_code": customer_code,
             "message": message,
         }
+
+
+def _days_in_month():
+    """当月天数：月度好礼要求签满整月"""
+    today = datetime.date.today()
+    return calendar.monthrange(today.year, today.month)[1]
 
 
 def _to_number(value):
