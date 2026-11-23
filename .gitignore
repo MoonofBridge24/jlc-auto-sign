@@ -1,0 +1,26 @@
+# ---- Python 虚拟环境 / 缓存（本地验证用，禁止提交）----
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ---- 本地调试产物 ----
+debug/
+screenshots/
+*.log
+.env
+.env.*
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- WorkBuddy 项目数据 ----
+.workbuddy/

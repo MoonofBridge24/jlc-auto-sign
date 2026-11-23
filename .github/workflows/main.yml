@@ -35,5 +35,8 @@ jobs:
         uses: nanasess/setup-chromedriver@v2
 
       - name: 'Working'
+        env:
+          # Server酱3 推送（可选）：不配置该 secret 则跳过推送
+          SERVERCHAN3_SCKEY: ${{ secrets.SERVERCHAN3_SCKEY }}
         run: |
           python ./jlc.py ${{ secrets.JLC_USERNAME }} ${{ secrets.JLC_PASSWORD }}

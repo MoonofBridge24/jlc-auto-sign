@@ -1,10 +1,12 @@
 import os
+import re
 import sys
 import time
 import json
 import tempfile
 import random
 import requests
+import selenium
 from datetime import datetime, timedelta
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -13,7 +15,23 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from serverchan_sdk import sc_send
+
+try:
+    import captcha_solver
+except ImportError:
+    captcha_solver = None
+
+try:
+    import stealth
+except ImportError:
+    stealth = None
+
+# 默认无头运行（GitHub Actions 没有显示器）；本地调试可以设 JLC_HEADLESS=0 打开窗口
+HEADLESS = os.getenv("JLC_HEADLESS", "1") != "0"
+# 浏览器类型：chrome / edge，默认 chrome（本地没有 Chrome 时可指定 edge）
+BROWSER = os.getenv("JLC_BROWSER", "chrome").strip().lower()
+SELENIUM_MAJOR = int(str(getattr(selenium, "__version__", "4")).split(".")[0])
+
 
 # 全局变量用于收集总结日志
 in_summary = False
@@ -24,6 +42,74 @@ def log(msg):
     print(full_msg, flush=True)
     if in_summary:
         summary_logs.append(msg)  # 只收集纯消息，无时间戳
+
+def create_driver():
+    """
+    创建浏览器驱动（兼容 selenium 3.x / 4.x）。
+
+    注意：这里不再加 --blink-settings=imagesEnabled=false。
+    阿里云验证码的滑块是背景图渲染的，禁用图片后元素尺寸会变成 0，
+    既定位不到滑块，也过不了验证。
+    """
+    if BROWSER == "edge":
+        from selenium.webdriver.edge.options import Options as EdgeOptions
+        opts = EdgeOptions()
+        driver_class = webdriver.Edge
+    else:
+        opts = Options()
+        driver_class = webdriver.Chrome
+
+    if HEADLESS:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--user-data-dir=%s" % tempfile.mkdtemp())
+    opts.add_argument("--lang=zh-CN")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    # selenium 3.141 的 Edge Options 没有 add_experimental_option，这里做兼容
+    for _name, _value in (("excludeSwitches", ["enable-automation"]),
+                          ("useAutomationExtension", False)):
+        try:
+            opts.add_experimental_option(_name, _value)
+        except (AttributeError, KeyError):
+            pass
+
+    if SELENIUM_MAJOR >= 4:
+        opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+
+    def _build():
+        if SELENIUM_MAJOR >= 4:
+            return driver_class(options=opts)
+        if BROWSER == "edge":
+            # selenium 3 对 Edge Chromium 支持有限，只传 options
+            return driver_class(options=opts)
+        caps = DesiredCapabilities.CHROME
+        caps['goog:loggingPrefs'] = {'performance': 'ALL'}
+        return driver_class(options=opts, desired_capabilities=caps)
+
+    try:
+        driver = _build()
+    except Exception as e:
+        # Chrome 109 以下不认识 --headless=new，退回旧的无头参数再试一次
+        if not HEADLESS or "--headless=new" not in (opts.arguments or []):
+            raise
+        log("--headless=new 启动失败（%s），改用 --headless 重试" % str(e).splitlines()[0][:120])
+        opts.arguments.remove("--headless=new")
+        opts.add_argument("--headless")
+        driver = _build()
+
+    # 抹掉驱动特征（cdc_* / navigator.webdriver 等），否则阿里云滑块必被判风险
+    if stealth:
+        stealth.apply(driver)
+
+    # 老版本 selenium 的 Edge 驱动没有 CDP 接口，滑块无法稳定通过，提前提示
+    if not hasattr(driver, "execute_cdp_cmd"):
+        log("警告: 当前驱动不支持 CDP 鼠标事件，滑块可能无法通过；"
+            "建议使用 Chrome（JLC_BROWSER=chrome）并搭配 selenium 4")
+
+    return driver
 
 def format_nickname(nickname):
     """格式化昵称，只显示第一个字和最后一个字，中间用星号代替"""
@@ -527,120 +613,108 @@ def get_user_nickname_from_api(driver, account_index):
         return None
 
 def ensure_login_page(driver, account_index):
-    """确保进入登录页面，如果未检测到登录页面则重启浏览器"""
+    """
+    确保进入登录页面；如需重启浏览器则新建并返回，调用方必须使用返回的 driver。
+
+    注意：oshwhub.com/sign_in 现在并不总是自动跳转到 passport，
+    页面上会渲染一个「登录」链接，所以这里补了一段兜底：等不到跳转就直接访问该链接。
+    """
     max_restarts = 5
     restarts = 0
-    
+
     while restarts < max_restarts:
         try:
             driver.get("https://oshwhub.com/sign_in")
             log(f"账号 {account_index} - 已打开 JLC 签到页")
-            
-            WebDriverWait(driver, 10).until(lambda d: "passport.jlc.com/login" in d.current_url)
-            current_url = driver.current_url
 
-            # 检查是否在登录页面
-            if "passport.jlc.com/login" in current_url:
+            if _wait_passport_login(driver, timeout=8):
                 log(f"账号 {account_index} - ? 检测到未登录状态")
-                return True
-            else:
-                restarts += 1
-                if restarts < max_restarts:
-                    # 静默重启浏览器
-                    driver.quit()
-                    
-                    # 重新初始化浏览器
-                    chrome_options = Options()
-                    chrome_options.add_argument("--headless=new")
-                    chrome_options.add_argument("--no-sandbox")
-                    chrome_options.add_argument("--disable-dev-shm-usage")
-                    chrome_options.add_argument("--disable-gpu")
-                    chrome_options.add_argument("--window-size=1920,1080")
-                    chrome_options.add_argument(f"--user-data-dir={tempfile.mkdtemp()}")
-                    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-                    chrome_options.add_argument("--blink-settings=imagesEnabled=false")
-                    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-                    chrome_options.add_experimental_option('useAutomationExtension', False)
+                return True, driver
 
-                    caps = DesiredCapabilities.CHROME
-                    caps['goog:loggingPrefs'] = {'performance': 'ALL'}
-                    
-                    driver = webdriver.Chrome(options=chrome_options, desired_capabilities=caps)
-                    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-                    
-                    # 静默等待后继续循环
-                    time.sleep(2)
-                else:
-                    log(f"账号 {account_index} - ? 重启浏览器{max_restarts}次后仍无法进入登录页面")
-                    return False
-                    
+            # 没有自动跳转，自己点「登录」链接
+            href = None
+            try:
+                link = driver.find_element(By.CSS_SELECTOR, 'a[href*="passport.jlc.com/login"]')
+                href = link.get_attribute("href")
+            except Exception:
+                pass
+
+            if href:
+                log(f"账号 {account_index} - 页面未自动跳转，主动打开发登录页")
+                driver.get(href)
+            else:
+                log(f"账号 {account_index} - 页面未自动跳转，尝试点击登录按钮")
+                try:
+                    driver.find_element(By.XPATH, '//a[contains(text(),"登录") or contains(text(),"登 录")]').click()
+                except Exception:
+                    pass
+
+            if _wait_passport_login(driver, timeout=10):
+                log(f"账号 {account_index} - ? 检测到未登录状态")
+                return True, driver
+
+            restarts += 1
+            if restarts >= max_restarts:
+                log(f"账号 {account_index} - ? 重启浏览器{max_restarts}次后仍无法进入登录页面")
+                return False, driver
+
         except Exception as e:
             restarts += 1
-            if restarts < max_restarts:
-                try:
-                    driver.quit()
-                except:
-                    pass
-                
-                # 重新初始化浏览器
-                chrome_options = Options()
-                chrome_options.add_argument("--headless=new")
-                chrome_options.add_argument("--no-sandbox")
-                chrome_options.add_argument("--disable-dev-shm-usage")
-                chrome_options.add_argument("--disable-gpu")
-                chrome_options.add_argument("--window-size=1920,1080")
-                chrome_options.add_argument(f"--user-data-dir={tempfile.mkdtemp()}")
-                chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-                chrome_options.add_argument("--blink-settings=imagesEnabled=false")
-                chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-                chrome_options.add_experimental_option('useAutomationExtension', False)
-
-                caps = DesiredCapabilities.CHROME
-                caps['goog:loggingPrefs'] = {'performance': 'ALL'}
-                
-                driver = webdriver.Chrome(options=chrome_options, desired_capabilities=caps)
-                driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-                
-                time.sleep(2)
-            else:
+            if restarts >= max_restarts:
                 log(f"账号 {account_index} - ? 重启浏览器{max_restarts}次后仍出现异常: {e}")
-                return False
-    
+                return False, driver
+
+        # 静默重启浏览器
+        try:
+            driver.quit()
+        except:
+            pass
+        driver = create_driver()
+        time.sleep(2)
+
+    return False, driver
+
+
+def _wait_passport_login(driver, timeout=8.0):
+    """等待当前页变成 passport 登录页"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            url = driver.current_url or ""
+            if "passport.jlc.com" in url and "login" in url:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.4)
     return False
 
-def check_password_error(driver, account_index):
-    """检查页面是否显示密码错误提示"""
-    try:
-        # 等待可能出现的错误提示元素
-        error_selectors = [
-            "//*[contains(text(), '账号或密码不正确')]",
-            "//*[contains(text(), '用户名或密码错误')]",
-            "//*[contains(text(), '密码错误')]",
-            "//*[contains(text(), '登录失败')]",
-            "//*[contains(@class, 'error')]",
-            "//*[contains(@class, 'err-msg')]",
-            "//*[contains(@class, 'toast')]",
-            "//*[contains(@class, 'message')]"
-        ]
-        
-        for selector in error_selectors:
-            try:
-                # 使用短暂的等待来检查错误提示
-                error_element = WebDriverWait(driver, 2).until(
-                    EC.presence_of_element_located((By.XPATH, selector))
-                )
-                if error_element.is_displayed():
-                    error_text = error_element.text.strip()
-                    if any(keyword in error_text for keyword in ['账号或密码不正确', '用户名或密码错误', '密码错误', '登录失败']):
-                        log(f"账号 {account_index} - ? 检测到账号或密码错误，跳过此账号")
-                        return True
-            except:
-                continue
-                
-        return False
-    except Exception as e:
-        log(f"账号 {account_index} - ? 检查密码错误时出现异常: {e}")
-        return False
+
+def check_password_error(driver, account_index, timeout=2.5):
+    """
+    检查页面是否出现密码错误提示。
+
+    原来是对 8 个 XPath 逐个 WebDriverWait(2s)，命中前要白等十几秒（多账号时很致命）。
+    这里改成直接读 body 文本轮询，通常几十毫秒就能判定。
+    """
+    keywords = ('账号或密码不正确', '用户名或密码错误', '密码错误',
+                '账号或密码错误', '登录失败')
+    deadline = time.time() + timeout
+    while True:
+        try:
+            page_text = driver.execute_script(
+                "var b = document.body; return b ? b.innerText.slice(0, 4000) : '';") or ''
+        except Exception as e:
+            log(f"账号 {account_index} - ? 检查密码错误时出现异常: {e}")
+            return False
+
+        for kw in keywords:
+            if kw in page_text:
+                log(f"账号 {account_index} - ? 检测到账号或密码错误，跳过此账号")
+                return True
+
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.25)
 
 def sign_in_account(username, password, account_index, total_accounts, retry_count=0, is_final_retry=False):
     """为单个账号执行完整的签到流程（包含重试机制）"""
@@ -652,24 +726,7 @@ def sign_in_account(username, password, account_index, total_accounts, retry_cou
     
     log(f"开始处理账号 {account_index}/{total_accounts}{retry_label}")
     
-    chrome_options = Options()
-    chrome_options.add_argument("--headless=new")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--window-size=1920,1080")
-    chrome_options.add_argument(f"--user-data-dir={tempfile.mkdtemp()}")
-    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-    chrome_options.add_argument("--blink-settings=imagesEnabled=false")  # 禁用图像加载
-    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    chrome_options.add_experimental_option('useAutomationExtension', False)
-
-    caps = DesiredCapabilities.CHROME
-    caps['goog:loggingPrefs'] = {'performance': 'ALL'}
-    
-    driver = webdriver.Chrome(options=chrome_options, desired_capabilities=caps)
-    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    
+    driver = create_driver()
     wait = WebDriverWait(driver, 25)
     
     # 记录详细结果
@@ -696,10 +753,12 @@ def sign_in_account(username, password, account_index, total_accounts, retry_cou
     }
 
     try:
-        # 1. 确保进入登录页面
-        if not ensure_login_page(driver, account_index):
+        # 1. 确保进入登录页面（必要时会重启浏览器，返回新的 driver）
+        login_ready, driver = ensure_login_page(driver, account_index)
+        if not login_ready:
             result['oshwhub_status'] = '无法进入登录页'
             return result
+        wait = WebDriverWait(driver, 25)
 
         current_url = driver.current_url
 
@@ -754,58 +813,48 @@ def sign_in_account(username, password, account_index, total_accounts, retry_cou
             result['oshwhub_status'] = '密码错误'
             return result
 
-        # 处理滑块验证
-        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".btn_slide")))
-        try:
-            slider = wait.until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, ".btn_slide"))
-            )
-            
-            track = wait.until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, ".nc_scale"))
-            )
-            
-            track_width = track.size['width']
-            slider_width = slider.size['width']
-            move_distance = track_width - slider_width - 10
-            
-            log(f"账号 {account_index} - 检测到滑块验证码，滑动距离: {move_distance}px")
-            
-            actions = ActionChains(driver)
-            actions.click_and_hold(slider).perform()
-            time.sleep(0.5)
-            
-            quick_distance = int(move_distance * random.uniform(0.6, 0.8))
-            slow_distance = move_distance - quick_distance
-            
-            y_offset1 = random.randint(-2, 2)
-            actions.move_by_offset(quick_distance, y_offset1).perform()
-            time.sleep(random.uniform(0.1, 0.3))
-            
-            y_offset2 = random.randint(-2, 2)
-            actions.move_by_offset(slow_distance, y_offset2).perform()
-            time.sleep(random.uniform(0.05, 0.15))
-            
-            actions.release().perform()
-            log(f"账号 {account_index} - 滑块拖动完成")
-            
-            # 滑块验证后立即检查密码错误提示
-            time.sleep(1)  # 给错误提示一点时间显示
-            if check_password_error(driver, account_index):
-                result['password_error'] = True
-                result['oshwhub_status'] = '密码错误'
+        # 处理安全验证：现网是阿里云验证码 2.0（aliyunCaptcha 滑块），旧版易盾作兜底
+        captcha_kind = None
+        if captcha_solver:
+            try:
+                captcha_kind, _ = captcha_solver.wait_for_captcha(driver, timeout=12)
+            except Exception as e:
+                log(f"账号 {account_index} - 检测安全验证时出错: {e}")
+
+        if captcha_kind:
+            captcha_label = "阿里云" if captcha_kind == "aliyun" else "易盾"
+            log(f"账号 {account_index} - 检测到{captcha_label}滑块验证，开始处理...")
+
+            def _captcha_log(msg, _idx=account_index):
+                log(f"账号 {_idx} {msg}")
+
+            try:
+                captcha_result = captcha_solver.solve_captcha(
+                    driver, log=_captcha_log, kind=captcha_kind)
+            except Exception as e:
+                log(f"账号 {account_index} - 滑块处理异常: {e}")
+                captcha_result = "failed"
+
+            if captcha_result != "passed":
+                log(f"账号 {account_index} - ? 滑块验证未通过")
+                time.sleep(1)
+                if check_password_error(driver, account_index):
+                    result['password_error'] = True
+                    result['oshwhub_status'] = '密码错误'
+                    return result
+                result['oshwhub_status'] = '滑块验证失败'
                 return result
-                
-            WebDriverWait(driver, 10).until(lambda d: "oshwhub.com" in d.current_url and "passport.jlc.com" not in d.current_url)
-            
-        except Exception as e:
-            log(f"账号 {account_index} - 滑块验证处理: {e}")
-            # 滑块验证失败后检查密码错误
-            time.sleep(1)
-            if check_password_error(driver, account_index):
-                result['password_error'] = True
-                result['oshwhub_status'] = '密码错误'
-                return result
+
+            log(f"账号 {account_index} - ? 滑块验证通过")
+        else:
+            log(f"账号 {account_index} - 未检测到滑块验证，继续等待登录跳转")
+
+        # 验证通过后立刻检查密码错误提示
+        time.sleep(1)
+        if check_password_error(driver, account_index):
+            result['password_error'] = True
+            result['oshwhub_status'] = '密码错误'
+            return result
 
         # 等待跳转
         log(f"账号 {account_index} - 等待登录跳转...")
@@ -1149,7 +1198,189 @@ def execute_final_retry_for_failed_accounts(all_results, usernames, passwords, t
     return all_results
 
 # 推送函数
-def push_summary():
+SERVERCHAN3_TAGS = "嘉立创|签到"
+
+
+def parse_serverchan3_keys(total_accounts):
+    """
+    解析 Server酱3 的 sendkey 配置，返回 {账号序号: sendkey}。
+
+    SERVERCHAN3_SCKEY 支持用逗号（或换行/分号）分隔多个 key，按账号顺序一一对应：
+        SERVERCHAN3_SCKEY=sctp111tAAA,sctp222tBBB
+    - 账号 1 用第 1 个，账号 2 用第 2 个，以此类推；
+    - 某个账号没配（数量不够或该位置留空）就回落到第一个 key；
+    - 完全没配置则返回空 dict，调用方跳过推送。
+    """
+    raw = os.getenv('SERVERCHAN3_SCKEY', '') or ''
+    parts = [p.strip() for p in re.split(r'[,\n;]+', raw)]
+
+    first = next((p for p in parts if p), None)
+    if not first:
+        return {}
+
+    mapping = {}
+    for index in range(1, total_accounts + 1):
+        key = parts[index - 1] if index - 1 < len(parts) else ''
+        mapping[index] = key or first
+    return mapping
+
+
+def _mask_key(sendkey):
+    """日志里不打印完整 sendkey"""
+    if len(sendkey) <= 10:
+        return sendkey[:2] + "***"
+    return sendkey[:8] + "***" + sendkey[-4:]
+
+
+def _serverchan3_endpoint(sendkey):
+    """
+    Server酱3 的发送地址是 https://{uid}.push.ft07.com/send/{sendkey}.send，
+    uid 可以直接从 sendkey 里取（sctp{uid}t...）。
+    """
+    match = re.match(r'^sctp(\d+)t', sendkey)
+    if not match:
+        return None
+    return "https://{}.push.ft07.com/send/{}.send".format(match.group(1), sendkey)
+
+
+def mask_account(account):
+    """
+    账号打码：前后各保留 3 位，中间固定 4 个星号（少留一位容易撞车）。
+    12345678A -> 123****78A，abcde@qq.com -> abc****@qq.com
+    """
+    text = (account or '').strip()
+    if not text:
+        return "未知账号"
+    if '@' in text:
+        local, _, domain = text.partition('@')
+        head = local[:3] if len(local) > 3 else local[:1]
+        return "{}****@{}".format(head, domain)
+    if len(text) <= 3:
+        return "{}****".format(text[:1])
+    if len(text) <= 6:
+        return "{}****{}".format(text[:1], text[-1:])
+    return "{}****{}".format(text[:3], text[-3:])
+
+
+def _fmt_reward(value):
+    """金豆数量去掉多余的 .0：2.0 -> 2，2.5 -> 2.5"""
+    try:
+        return "{:g}".format(float(value))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _account_line(account, result):
+    """返回 (类别, 一行描述)；类别为 ok / already / failed"""
+    if result.get('password_error'):
+        return 'failed', "❌ 账号({})：账号或密码错误".format(account)
+
+    status = result.get('jindou_status') or '未知'
+    if status == '签到成功':
+        return 'ok', "✅ 账号({})：获取{}个金豆，当前总数：{}".format(
+            account, _fmt_reward(result.get('jindou_reward') or 0),
+            result.get('final_jindou') or 0)
+    if status == '已签到过':
+        return 'already', "✅ 账号({})：今日已签到，当前总数：{}".format(
+            account, result.get('final_jindou') or 0)
+    return 'failed', "❌ 账号({})：签到失败（{}）".format(account, status)
+
+
+def _build_serverchan3_desp(group_results, usernames):
+    """
+    生成推送正文（Server酱3 走 markdown，单换行会被拼在一起，所以行间用双换行）：
+
+        签到统计
+        成功：4
+        已签到：0
+        失败：0
+        【签到成功】
+        ✅ 账号(12****5A)：获取2个金豆，当前总数：90.0
+        ...
+    """
+    ok = already = failed = 0
+    details = []
+
+    for result in group_results:
+        index = result.get('account_index')
+        account = ""
+        if usernames and isinstance(index, int) and 0 <= index - 1 < len(usernames):
+            account = mask_account(usernames[index - 1])
+
+        kind, line = _account_line(account, result)
+        if kind == 'ok':
+            ok += 1
+        elif kind == 'already':
+            already += 1
+        else:
+            failed += 1
+        details.append(line)
+
+    lines = [
+        "签到统计",
+        "成功：{}".format(ok),
+        "已签到：{}".format(already),
+        "失败：{}".format(failed),
+        "【签到成功】" if failed == 0 else "【签到失败】",
+    ]
+    lines.extend(details)
+    return "\n\n".join(lines), failed
+
+
+def push_serverchan3(all_results, total_accounts, usernames=None):
+    """按 sendkey 分组推送；同一个 sendkey 的账号合并成一条消息"""
+    mapping = parse_serverchan3_keys(total_accounts)
+    if not mapping:
+        log("Server酱3-未配置 SERVERCHAN3_SCKEY，跳过推送")
+        return
+
+    result_map = {r['account_index']: r for r in all_results}
+
+    # 保持账号顺序分组，避免同一个 key 多次推送
+    groups = {}
+    order = []
+    for index in sorted(mapping):
+        key = mapping[index]
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(index)
+
+    for key in order:
+        indexes = groups[key]
+        endpoint = _serverchan3_endpoint(key)
+        if not endpoint:
+            log("Server酱3-第 {} 个 sendkey 格式不正确（应以 sctp 开头），跳过".format(
+                order.index(key) + 1))
+            continue
+
+        group_results = [result_map[i] for i in indexes if i in result_map]
+        desp, failed = _build_serverchan3_desp(group_results, usernames)
+        title = "嘉立创签到失败" if failed else "嘉立创签到成功"
+
+        try:
+            response = requests.post(
+                endpoint,
+                data={"title": title, "desp": desp, "tags": SERVERCHAN3_TAGS},
+                timeout=20,
+            )
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {}
+
+            if payload.get("code") == 0:
+                log("Server酱3-已推送「{}」（{}，合并 {} 个账号）".format(
+                    title, _mask_key(key), len(indexes)))
+            else:
+                reason = payload.get("message") or payload.get("error") or response.text[:120]
+                log("Server酱3-推送失败「{}」（{}，合并 {} 个账号）: {}".format(
+                    title, _mask_key(key), len(indexes), reason))
+        except Exception as e:
+            log("Server酱3-推送异常（{}）: {}".format(_mask_key(key), e))
+
+
+def push_summary(all_results=None, total_accounts=0, usernames=None):
     if not summary_logs:
         return
     
@@ -1224,20 +1455,9 @@ def push_summary():
         except:
             pass
 
-    # Server酱3
-    serverchan3_sckey = os.getenv('SERVERCHAN3_SCKEY') 
-    if serverchan3_sckey:
-        try:
-            textSC3 = "\n\n".join(summary_logs)
-            titleSC3 = title
-            options = {"tags": "嘉立创|签到"}  # 可选参数，根据需求添加
-            response = sc_send(serverchan3_sckey, titleSC3, textSC3, options)            
-            if response.get("code") == 0:  # 新版成功返回 code=0
-                log("Server酱3-日志已推送")
-            else:
-                log(f"Server酱推送失败: {response.get('message')}")                
-        except Exception as e:
-            log(f"Server酱推送异常: {str(e)}")    
+    # Server酱3（同一 sendkey 的账号合并为一条推送）
+    if all_results is not None:
+        push_serverchan3(all_results, total_accounts, usernames)
 
     # 酷推 (CoolPush)
     coolpush_skey = os.getenv('COOLPUSH_SKEY')
@@ -1427,8 +1647,11 @@ def main():
     
     log("=" * 70)
     
-    # 推送总结
-    push_summary()
+    # 推送总结（Server酱3 按 sendkey 合并同一批账号）
+    try:
+        push_summary(all_results, total_accounts, usernames)
+    except Exception as e:
+        log(f"推送总结时出现异常: {e}")
     
     # 根据失败退出标志决定退出码
     all_failed_accounts = failed_accounts + password_error_accounts
